@@ -272,6 +272,15 @@ function routePeerAudio(peer, isActiveSpeaker) {
     return;
   }
 
+  // Relay peers have no MediaStream behind peer.audio, so their unprocessed
+  // monitoring path is a WebAudio tap rather than the <audio> element.
+  const setCleanGain = (value) => {
+    if (peer.relayCleanGain) {
+      peer.relayCleanGain.gain.value = value;
+    }
+  };
+  const isRelayPeer = peer.transport === "relay";
+
   // Half-duplex behavior: while transmitting, do not monitor inbound audio.
   if (state.isPttPressed) {
     peer.audio.muted = true;
@@ -279,6 +288,7 @@ function routePeerAudio(peer, isActiveSpeaker) {
     if (peer.peerGainNode) {
       peer.peerGainNode.gain.value = 0;
     }
+    setCleanGain(0);
     return;
   }
 
@@ -288,6 +298,7 @@ function routePeerAudio(peer, isActiveSpeaker) {
     if (peer.peerGainNode) {
       peer.peerGainNode.gain.value = 0;
     }
+    setCleanGain(0);
     return;
   }
 
@@ -297,6 +308,7 @@ function routePeerAudio(peer, isActiveSpeaker) {
     if (peer.peerGainNode) {
       peer.peerGainNode.gain.value = 0;
     }
+    setCleanGain(isRelayPeer ? state.rxVolume : 0);
     return;
   }
 
@@ -305,6 +317,7 @@ function routePeerAudio(peer, isActiveSpeaker) {
   if (peer.peerGainNode) {
     peer.peerGainNode.gain.value = state.rxVolume;
   }
+  setCleanGain(0);
 }
 
 function applyCurrentMonitorRouting() {
@@ -525,6 +538,9 @@ async function switchMicrophone(deviceId) {
     }
 
     for (const peer of state.peers.values()) {
+      if (!peer.pc) {
+        continue;
+      }
       const sender = peer.pc.getSenders().find((item) => item.track && item.track.kind === "audio");
       if (sender) {
         await sender.replaceTrack(newTrack);
@@ -1252,17 +1268,12 @@ function playUiClick() {
   }, 90);
 }
 
-function connectPeerAudio(peer, stream) {
+// Builds the walkie-talkie effects chain that inbound audio is played through.
+// Shared by both transports: WebRTC feeds it from a MediaStreamSource, while the
+// binary relay feeds it from scheduled PCM buffers.
+function ensurePeerRadioChain(peer) {
   if (!state.audioCtx) {
     return;
-  }
-
-  if (peer.sourceNode) {
-    try {
-      peer.sourceNode.disconnect();
-    } catch (_err) {
-      // Ignore stale graph disconnection errors from previous tracks.
-    }
   }
 
   if (!peer.peerGainNode) {
@@ -1366,9 +1377,238 @@ function connectPeerAudio(peer, stream) {
     peer.radioBoost = radioBoost;
     peer.rxAnalyserNode = rxAnalyser;
   }
+}
+
+function connectPeerAudio(peer, stream) {
+  if (!state.audioCtx) {
+    return;
+  }
+
+  if (peer.sourceNode) {
+    try {
+      peer.sourceNode.disconnect();
+    } catch (_err) {
+      // Ignore stale graph disconnection errors from previous tracks.
+    }
+  }
+
+  ensurePeerRadioChain(peer);
 
   peer.sourceNode = state.audioCtx.createMediaStreamSource(stream);
   peer.sourceNode.connect(peer.peerGainNode);
+}
+
+/* ── RELAY_TRANSPORT: binary PCM over the signalling socket ─────────────
+ * The in-game OpenBVE client has no WebRTC stack, so it exchanges audio as
+ * raw PCM frames on the same WebSocket used for signalling. Wire format is
+ * fixed by VoiceClient.AudioFormat: 16 kHz, 16-bit signed little-endian, mono.
+ *
+ * The server routes any given pair of clients over exactly one transport —
+ * WebRTC when both ends speak it, the relay whenever either end is relay-only —
+ * so relay audio can never double up with the peer mesh.
+ * ─────────────────────────────────────────────────────────────────────── */
+const RELAY_SAMPLE_RATE = 16000;
+// Jitter cushion applied before the first frame of a transmission.
+const RELAY_JITTER_SEC = 0.12;
+// Rebuild the play head when the incoming stream stalls or runs far ahead.
+const RELAY_RESYNC_SEC = 0.35;
+
+let relayCaptureNode = null;
+let relayCaptureSource = null;
+let relayCaptureFilter = null;
+let relayCaptureSink = null;
+let relayResampleCarry = 0;
+
+// True when a relay-only peer is listening on the channel we transmit on.
+// Browser-to-browser audio stays on WebRTC, so there is no reason to spend
+// upstream bandwidth on PCM unless a game client is actually there to hear it.
+function hasRelayPeersOnChannel() {
+  for (const peer of state.peers.values()) {
+    if (peer.transport === "relay" && peer.channel === state.selectedChannel) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ensureRelayPlayback(peer) {
+  if (!state.audioCtx || peer.relayInputNode) {
+    return;
+  }
+
+  ensurePeerRadioChain(peer);
+
+  peer.relayInputNode = state.audioCtx.createGain();
+  peer.relayInputNode.gain.value = 1;
+
+  // Processed path — gated by peerGainNode exactly like WebRTC audio is.
+  if (peer.peerGainNode) {
+    peer.relayInputNode.connect(peer.peerGainNode);
+  }
+
+  // Unprocessed path for when the operator switches the audio filter off.
+  // WebRTC peers get that through their <audio> element, which relay peers
+  // have no stream to feed, so they need their own clean tap to master.
+  peer.relayCleanGain = state.audioCtx.createGain();
+  peer.relayCleanGain.gain.value = 0;
+  peer.relayInputNode.connect(peer.relayCleanGain);
+  peer.relayCleanGain.connect(state.masterOutput || state.audioCtx.destination);
+}
+
+function playRelayFrame(buffer) {
+  if (!state.audioCtx) {
+    return;
+  }
+
+  // Binary frames carry no sender id, but the server only relays frames from
+  // the current PTT holder, so the active speaker is the sender by construction.
+  const speakerId = state.activeSpeakerId;
+  if (!speakerId || speakerId === state.selfId) {
+    return;
+  }
+
+  const peer = state.peers.get(speakerId);
+  if (!peer) {
+    return;
+  }
+
+  ensureRelayPlayback(peer);
+  if (!peer.relayInputNode) {
+    return;
+  }
+
+  const pcm = new Int16Array(buffer);
+  if (!pcm.length) {
+    return;
+  }
+
+  const frame = state.audioCtx.createBuffer(1, pcm.length, RELAY_SAMPLE_RATE);
+  const channelData = frame.getChannelData(0);
+  for (let i = 0; i < pcm.length; i += 1) {
+    channelData[i] = pcm[i] / 32768;
+  }
+
+  const source = state.audioCtx.createBufferSource();
+  source.buffer = frame;
+  source.connect(peer.relayInputNode);
+
+  // Schedule back-to-back so frames play gaplessly, resyncing when the sender
+  // pauses (end of transmission) or we drift too far ahead of the clock.
+  const now = state.audioCtx.currentTime;
+  if (
+    !peer.relayPlayHead ||
+    peer.relayPlayHead < now ||
+    peer.relayPlayHead > now + RELAY_RESYNC_SEC
+  ) {
+    peer.relayPlayHead = now + RELAY_JITTER_SEC;
+  }
+
+  source.start(peer.relayPlayHead);
+  peer.relayPlayHead += frame.duration;
+}
+
+// Linear resample from the AudioContext rate down to the 16 kHz wire rate,
+// carrying the fractional read position across callbacks so frame boundaries
+// don't click.
+function resampleToRelayPcm(input, inputRate) {
+  const ratio = inputRate / RELAY_SAMPLE_RATE;
+  if (!(ratio > 0) || !input.length) {
+    return null;
+  }
+
+  const outLength = Math.floor((input.length - relayResampleCarry) / ratio);
+  if (outLength <= 0) {
+    relayResampleCarry = Math.max(0, relayResampleCarry - input.length);
+    return null;
+  }
+
+  const out = new Int16Array(outLength);
+  let pos = relayResampleCarry;
+  for (let i = 0; i < outLength; i += 1) {
+    const idx = Math.floor(pos);
+    const frac = pos - idx;
+    const a = input[idx] || 0;
+    const b = idx + 1 < input.length ? input[idx + 1] : a;
+    const sample = Math.max(-1, Math.min(1, a + (b - a) * frac));
+    out[i] = sample < 0 ? sample * 32768 : sample * 32767;
+    pos += ratio;
+  }
+
+  relayResampleCarry = Math.max(0, pos - input.length);
+  return out;
+}
+
+function startRelayCapture() {
+  if (relayCaptureNode || !state.audioCtx || !state.localStream) {
+    return;
+  }
+
+  const ctx = state.audioCtx;
+  relayResampleCarry = 0;
+
+  relayCaptureSource = ctx.createMediaStreamSource(state.localStream);
+
+  // Anti-alias before decimating to 16 kHz (8 kHz Nyquist).
+  relayCaptureFilter = ctx.createBiquadFilter();
+  relayCaptureFilter.type = "lowpass";
+  relayCaptureFilter.frequency.value = 7000;
+  relayCaptureFilter.Q.value = 0.7;
+
+  relayCaptureNode = ctx.createScriptProcessor(4096, 1, 1);
+  relayCaptureNode.onaudioprocess = (event) => {
+    if (!state.txGranted) {
+      return;
+    }
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const pcm = resampleToRelayPcm(
+      event.inputBuffer.getChannelData(0),
+      event.inputBuffer.sampleRate
+    );
+    if (pcm && pcm.length) {
+      state.ws.send(pcm.buffer);
+    }
+  };
+
+  relayCaptureSource.connect(relayCaptureFilter);
+  relayCaptureFilter.connect(relayCaptureNode);
+
+  // A ScriptProcessor only fires while it has a downstream connection; the
+  // silent sink keeps it running without feeding the operator's own voice back
+  // into their earpiece.
+  relayCaptureSink = ctx.createGain();
+  relayCaptureSink.gain.value = 0;
+  relayCaptureNode.connect(relayCaptureSink);
+  relayCaptureSink.connect(ctx.destination);
+}
+
+function stopRelayCapture() {
+  for (const node of [
+    relayCaptureSource,
+    relayCaptureFilter,
+    relayCaptureNode,
+    relayCaptureSink
+  ]) {
+    if (!node) {
+      continue;
+    }
+    try {
+      node.disconnect();
+    } catch (_err) {
+      // Ignore teardown races on an already-torn-down graph.
+    }
+  }
+
+  if (relayCaptureNode) {
+    relayCaptureNode.onaudioprocess = null;
+  }
+
+  relayCaptureSource = null;
+  relayCaptureFilter = null;
+  relayCaptureNode = null;
+  relayCaptureSink = null;
+  relayResampleCarry = 0;
 }
 
 function setStatus(message) {
@@ -1664,6 +1904,15 @@ function applyVolumeState() {
     if (peer.audio && state.cleanMonitorEnabled) {
       peer.audio.volume = state.rxVolume;
     }
+    // Track volume changes on an in-progress relay transmission without
+    // un-gating a peer that routePeerAudio has currently silenced.
+    if (
+      peer.relayCleanGain &&
+      state.cleanMonitorEnabled &&
+      peer.relayCleanGain.gain.value > 0
+    ) {
+      peer.relayCleanGain.gain.value = state.rxVolume;
+    }
   }
 
   setKnobRotation(volKnobEl, state.masterVolume);
@@ -1837,12 +2086,19 @@ function ensurePeer(peerInfo) {
     if (typeof peerInfo.rank === "string" && peerInfo.rank.trim()) {
       existing.rank = peerInfo.rank;
     }
+    if (typeof peerInfo.transport === "string" && peerInfo.transport.trim()) {
+      existing.transport = peerInfo.transport === "relay" ? "relay" : "webrtc";
+    }
     return existing;
   }
 
-  const pc = new RTCPeerConnection(stunConfig);
+  // Relay-only peers (the in-game client) have no WebRTC stack, so there is no
+  // peer connection to negotiate — their audio arrives as PCM frames over the
+  // WebSocket instead. See RELAY_TRANSPORT below.
+  const transport = peerInfo.transport === "relay" ? "relay" : "webrtc";
+  const pc = transport === "relay" ? null : new RTCPeerConnection(stunConfig);
 
-  if (state.localStream) {
+  if (pc && state.localStream) {
     for (const track of state.localStream.getTracks()) {
       pc.addTrack(track, state.localStream);
     }
@@ -1855,26 +2111,28 @@ function ensurePeer(peerInfo) {
   audio.volume = 0;
   applyAudioOutputSink(audio);
 
-  pc.ontrack = (event) => {
-    audio.srcObject = event.streams[0];
-    audio.play().catch(() => {
-      // Playback may need a user gesture on some browsers.
-    });
-    connectPeerAudio(peer, event.streams[0]);
-  };
+  if (pc) {
+    pc.ontrack = (event) => {
+      audio.srcObject = event.streams[0];
+      audio.play().catch(() => {
+        // Playback may need a user gesture on some browsers.
+      });
+      connectPeerAudio(peer, event.streams[0]);
+    };
 
-  pc.onicecandidate = (event) => {
-    if (!event.candidate) {
-      return;
-    }
-
-    wsSend("signal", {
-      to: peerInfo.id,
-      data: {
-        candidate: event.candidate
+    pc.onicecandidate = (event) => {
+      if (!event.candidate) {
+        return;
       }
-    });
-  };
+
+      wsSend("signal", {
+        to: peerInfo.id,
+        data: {
+          candidate: event.candidate
+        }
+      });
+    };
+  }
 
   const peer = {
     id: peerInfo.id,
@@ -1882,10 +2140,14 @@ function ensurePeer(peerInfo) {
     role: (typeof peerInfo.role === "string" && peerInfo.role.trim()) ? peerInfo.role : "operator",
     rank: (typeof peerInfo.rank === "string" && peerInfo.rank.trim()) ? peerInfo.rank : "t1",
     channel: (typeof peerInfo.channel === "string" && peerInfo.channel.trim()) ? peerInfo.channel : "operators",
+    transport,
     pc,
     audio,
     sourceNode: null,
     peerGainNode: null,
+    relayInputNode: null,
+    relayCleanGain: null,
+    relayPlayHead: 0,
     radioHighpass: null,
     radioLowpass: null,
     lowMidDip: null,
@@ -1903,6 +2165,10 @@ function ensurePeer(peerInfo) {
 
 async function createOffer(peerInfo) {
   const peer = ensurePeer(peerInfo);
+  if (!peer.pc) {
+    // Relay-only peer — nothing to negotiate.
+    return;
+  }
   const offer = await peer.pc.createOffer();
   await peer.pc.setLocalDescription(offer);
 
@@ -1916,6 +2182,10 @@ async function createOffer(peerInfo) {
 
 async function handleSignal(from, data) {
   const peer = ensurePeer({ id: from, role: "operator" });
+  if (!peer.pc) {
+    // A relay-only peer should never signal; ignore it rather than throwing.
+    return;
+  }
 
   if (data.description) {
     const desc = data.description;
@@ -1988,6 +2258,14 @@ function setTx(enabled) {
   state.txGranted = enabled;
   if (state.localTrack) {
     state.localTrack.enabled = enabled;
+  }
+
+  // Mirror the transmission onto the PCM relay so relay-only peers (the in-game
+  // client) can hear it. WebRTC peers are already covered by the mesh.
+  if (enabled && hasRelayPeersOnChannel()) {
+    startRelayCapture();
+  } else if (!enabled) {
+    stopRelayCapture();
   }
 
   if (enabled) {
@@ -2218,6 +2496,8 @@ async function join(roomId, userName) {
   const wsBaseUrl = `${wsProtocol}://${location.host}`;
   const wsUrl = wsBaseUrl; // auth is cookie-based
   state.ws = new WebSocket(wsUrl);
+  // Relayed PCM arrives as binary; ArrayBuffer lets us decode it synchronously.
+  state.ws.binaryType = "arraybuffer";
 
   state.ws.onopen = () => {
     setPowerState("on");
@@ -2228,7 +2508,8 @@ async function join(roomId, userName) {
       roomId: roomId || state.currentRoom || "mta-main",
       userName: userName || undefined,
       role: roleEl.value,
-      trainId: trainIdEl.value
+      trainId: trainIdEl.value,
+      transport: "webrtc"
     });
 
     setStatus("Joining room...");
@@ -2290,6 +2571,12 @@ async function join(roomId, userName) {
   };
 
   state.ws.onmessage = async (event) => {
+    // Binary frames are relayed PCM audio from a relay-only peer, not JSON.
+    if (typeof event.data !== "string") {
+      playRelayFrame(event.data);
+      return;
+    }
+
     const msg = JSON.parse(event.data);
 
     if (msg.type === "joined") {
@@ -2411,10 +2698,26 @@ async function join(roomId, userName) {
     if (msg.type === "peer-left") {
       const peer = state.peers.get(msg.payload.id);
       if (peer) {
-        peer.pc.close();
+        if (peer.pc) {
+          peer.pc.close();
+        }
         if (peer.sourceNode) {
           try {
             peer.sourceNode.disconnect();
+          } catch (_err) {
+            // Ignore cleanup errors.
+          }
+        }
+        if (peer.relayInputNode) {
+          try {
+            peer.relayInputNode.disconnect();
+          } catch (_err) {
+            // Ignore cleanup errors.
+          }
+        }
+        if (peer.relayCleanGain) {
+          try {
+            peer.relayCleanGain.disconnect();
           } catch (_err) {
             // Ignore cleanup errors.
           }
@@ -2644,6 +2947,10 @@ function muteAllPeers(muted) {
     if (peer.peerGainNode) {
       peer.peerGainNode.gain.value = muted ? 0 : state.rxVolume;
     }
+    // Unmuting is left to routePeerAudio so a silent peer stays silent.
+    if (muted && peer.relayCleanGain) {
+      peer.relayCleanGain.gain.value = 0;
+    }
     if (peer.audio) {
       peer.audio.muted = muted || !state.cleanMonitorEnabled;
       peer.audio.volume = muted ? 0 : state.rxVolume;
@@ -2773,7 +3080,8 @@ async function joinRoom(roomId, userName) {
     roomId,
     userName,
     role: roleEl.value,
-    trainId: trainIdEl.value
+    trainId: trainIdEl.value,
+    transport: "webrtc"
   });
 
   if (roomSelectionModalEl) {

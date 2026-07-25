@@ -113,6 +113,16 @@ function normalizeSessionRole(value) {
     return ALLOWED_SESSION_ROLES.has(v) ? v : "operator";
 }
 
+// Audio transport a client is able to negotiate.
+//   "webrtc" — browser clients: peer mesh with other webrtc clients, and can
+//              additionally send/receive PCM over the binary relay.
+//   "relay"  — the in-game client: binary PCM relay only, no WebRTC stack.
+// Audio between any pair of clients travels over exactly one transport: WebRTC
+// when both ends speak it, the relay whenever either end is relay-only.
+function normalizeTransport(value) {
+    return String(value || "").toLowerCase() === "relay" ? "relay" : "webrtc";
+}
+
 function canAccessChannel(rank, channelId) {
     if (!RESTRICTED_CHANNELS.has(channelId)) return true;
     return rank === "t3" || rank === "mod" || rank === "admin";
@@ -1182,6 +1192,7 @@ function getClientSummary(member) {
         rank: member.rank,
         trainId: member.trainId,
         channel: member.channel,
+        transport: member.transport || "webrtc",
     };
 }
 
@@ -1194,6 +1205,7 @@ function getLiveClientSummary(client) {
         rank: client.rank,
         trainId: client.trainId,
         channel: client.channel,
+        transport: client.transport || "webrtc",
     };
 }
 
@@ -1932,6 +1944,7 @@ wss.on("connection", (ws, req) => {
         line: "A",
         trainId: "",
         channel: DEFAULT_CHANNEL,
+        transport: "webrtc",
         wsUrl: req.url,
         wsHeaders: req.headers,
     };
@@ -1944,16 +1957,26 @@ wss.on("connection", (ws, req) => {
                 if (room) {
                     const chState = getChannelState(room, client.channel);
                     if (chState && chState.holderId === client.id) {
+                        const senderRelayOnly = client.transport === "relay";
                         for (const lid of room.clients) {
                             if (lid === client.id) continue;
                             const listener = clientsById.get(lid);
                             if (
-                                listener &&
-                                listener.channel === client.channel &&
-                                listener.ws.readyState === WebSocket.OPEN
+                                !listener ||
+                                listener.channel !== client.channel ||
+                                listener.ws.readyState !== WebSocket.OPEN
                             ) {
-                                listener.ws.send(raw, { binary: true });
+                                continue;
                             }
+                            // When both ends speak WebRTC the peer mesh already carries
+                            // this audio; relaying it too would play the transmission twice.
+                            if (
+                                !senderRelayOnly &&
+                                listener.transport !== "relay"
+                            ) {
+                                continue;
+                            }
+                            listener.ws.send(raw, { binary: true });
                         }
                     }
                 }
@@ -2062,6 +2085,7 @@ wss.on("connection", (ws, req) => {
                 payload.channel || DEFAULT_CHANNEL,
                 rank,
             );
+            client.transport = normalizeTransport(payload.transport);
 
             // Add to room members
             room.clients.add(client.id);
@@ -2073,6 +2097,7 @@ wss.on("connection", (ws, req) => {
                 rank: client.rank,
                 trainId: client.trainId,
                 channel: client.channel,
+                transport: client.transport,
             });
             clientsById.set(client.id, client);
 
