@@ -36,6 +36,8 @@ const state = {
   rogerBeepLoading: false,
   txGranted: false,
   isPttPressed: false,
+  /// Active room emergency, or null. Mirrors the server's emergency-state.
+  emergency: null,
   powerMode: "off",
   micAnalyserNode: null,
   micAnalyserSourceNode: null,
@@ -105,6 +107,9 @@ const adminPageBtn = document.getElementById("adminPageBtn");
 const leaveServerBtn = document.getElementById("leaveServerBtn");
 const pttBtn = document.getElementById("pttBtn");
 const cleanCheckBtn = document.getElementById("cleanCheckBtn");
+const emergencyBtn = document.getElementById("emergencyBtn");
+const emergencyBanner = document.getElementById("emergencyBanner");
+const emergencyWho = document.getElementById("emergencyWho");
 const radioFrameEl = document.getElementById("radioFrame");
 const volKnobEl = document.querySelector(".apx-vol");
 const serverStatusEl = document.getElementById("serverStatus");
@@ -1398,6 +1403,123 @@ function connectPeerAudio(peer, stream) {
   peer.sourceNode.connect(peer.peerGainNode);
 }
 
+/* ── EMERGENCY BROADCAST ───────────────────────────────────────────────
+ * A latched, room-wide state raised from the side nub. While it is up the
+ * server reserves the line for the raising operator and the dispatchers, and
+ * every client shows the banner and sounds the alarm. It is cleared by the
+ * operator who raised it or by any dispatcher.
+ * ─────────────────────────────────────────────────────────────────────── */
+let emergencyAlarmTimer = null;
+let emergencyAlarmNodes = null;
+
+function isEmergencyActive() {
+  return Boolean(state.emergency && state.emergency.active);
+}
+
+// Two-tone alarm, repeated for as long as the emergency stands.
+function playEmergencyTone() {
+  const ctx = state.audioCtx;
+  if (!ctx) {
+    return;
+  }
+
+  const now = ctx.currentTime;
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+  gain.connect(state.masterOutput || ctx.destination);
+
+  const osc = ctx.createOscillator();
+  osc.type = "square";
+  osc.connect(gain);
+
+  // hi-lo warble, roughly a classic emergency alert
+  osc.frequency.setValueAtTime(960, now);
+  osc.frequency.setValueAtTime(640, now + 0.22);
+  osc.frequency.setValueAtTime(960, now + 0.44);
+  osc.frequency.setValueAtTime(640, now + 0.66);
+
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(0.22 * state.rxVolume, now + 0.02);
+  gain.gain.setValueAtTime(0.22 * state.rxVolume, now + 0.84);
+  gain.gain.linearRampToValueAtTime(0, now + 0.88);
+
+  osc.start(now);
+  osc.stop(now + 0.9);
+  emergencyAlarmNodes = { osc, gain };
+}
+
+function startEmergencyAlarm() {
+  if (emergencyAlarmTimer !== null) {
+    return;
+  }
+  playEmergencyTone();
+  emergencyAlarmTimer = setInterval(playEmergencyTone, 1800);
+}
+
+function stopEmergencyAlarm() {
+  if (emergencyAlarmTimer !== null) {
+    clearInterval(emergencyAlarmTimer);
+    emergencyAlarmTimer = null;
+  }
+  if (emergencyAlarmNodes) {
+    try {
+      emergencyAlarmNodes.osc.stop();
+    } catch (_err) {
+      // Already stopped.
+    }
+    try {
+      emergencyAlarmNodes.gain.disconnect();
+    } catch (_err) {
+      // Already disconnected.
+    }
+    emergencyAlarmNodes = null;
+  }
+}
+
+function applyEmergencyState(payload) {
+  state.emergency = payload && payload.active ? payload : null;
+  const active = isEmergencyActive();
+
+  if (emergencyBanner) {
+    emergencyBanner.classList.toggle("visible", active);
+  }
+  if (emergencyWho) {
+    if (active) {
+      const who = state.emergency.trainId
+        ? `Train ${state.emergency.trainId}`
+        : state.emergency.operatorName || "Unknown unit";
+      const mine = state.emergency.operatorId === state.selfId;
+      emergencyWho.textContent = mine
+        ? `${who} (you) — press the red nub again to clear`
+        : `${who} — channel reserved for dispatchers`;
+    } else {
+      emergencyWho.textContent = "";
+    }
+  }
+  if (emergencyBtn) {
+    emergencyBtn.classList.toggle("active", active);
+    emergencyBtn.setAttribute("aria-pressed", active ? "true" : "false");
+  }
+
+  if (active) {
+    startEmergencyAlarm();
+    setChannelState("EMERGENCY");
+  } else {
+    stopEmergencyAlarm();
+  }
+}
+
+function toggleEmergency() {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  wsSend("emergency-set", { active: !isEmergencyActive() });
+}
+
+if (emergencyBtn) {
+  emergencyBtn.addEventListener("click", toggleEmergency);
+}
+
 /* ── RELAY_TRANSPORT: binary PCM over the signalling socket ─────────────
  * The in-game OpenBVE client has no WebRTC stack, so it exchanges audio as
  * raw PCM frames on the same WebSocket used for signalling. Wire format is
@@ -2517,6 +2639,8 @@ async function join(roomId, userName) {
 
   state.ws.onclose = (event) => {
     setPowerState("off");
+    // Never leave the alarm sounding once we are off the air.
+    applyEmergencyState(null);
     setServerStatus("Server: checking...");
     const closeCode = event && typeof event.code === "number" ? event.code : 0;
     const closeReason = event && event.reason ? ` (${event.reason})` : "";
@@ -2603,7 +2727,10 @@ async function join(roomId, userName) {
 
       // Keep role selector synced with server role/rank
       syncRoleSettingOnRadio();
-      
+
+      // Pick up an emergency already in progress, so joining mid-alarm still alarms.
+      applyEmergencyState(msg.payload.emergency);
+
       // Setup available channels from server
       if (Array.isArray(msg.payload.channels)) {
         state.availableChannels = msg.payload.channels;
@@ -2800,6 +2927,11 @@ async function join(roomId, userName) {
     if (msg.type === "ptt-granted") {
       setTx(true);
       setChannelState(`TX granted on ${msg.payload.channel}`);
+      return;
+    }
+
+    if (msg.type === "emergency-state") {
+      applyEmergencyState(msg.payload);
       return;
     }
 

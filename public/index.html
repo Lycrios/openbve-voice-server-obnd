@@ -27,6 +27,30 @@
         <p>Portable radio for OpenBVE multiplayer &nbsp;·&nbsp; <span id="loggedInUser" style="color:#d4a018"></span> &nbsp;<button id="adminPageBtn" type="button" hidden style="background:none;border:none;color:#88aacc;cursor:pointer;font-size:0.8rem;padding:0;text-decoration:underline;">Admin Page</button> &nbsp;<button id="logoutBtn" type="button" style="background:none;border:none;color:#888;cursor:pointer;font-size:0.8rem;padding:0;text-decoration:underline;">Logout</button></p>
       </section>
 
+      <!-- Room-wide emergency alarm -->
+      <div
+        class="apx-emergency-banner"
+        id="emergencyBanner"
+        role="alert"
+        aria-live="assertive"
+      >
+        <span class="apx-emergency-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" role="img" focusable="false">
+            <rect x="9" y="2" width="6" height="11" rx="3" />
+            <path
+              d="M5 11a7 7 0 0 0 14 0"
+              fill="none"
+              stroke-width="2"
+              stroke-linecap="round"
+            />
+            <rect x="11" y="18" width="2" height="4" rx="1" />
+            <rect x="7.5" y="21" width="9" height="2" rx="1" />
+          </svg>
+        </span>
+        <span>EMERGENCY</span>
+        <span class="who" id="emergencyWho"></span>
+      </div>
+
       <div class="apx-wrapper">
 
         <!-- Antenna -->
@@ -45,8 +69,15 @@
             <span class="apx-ptt-indicator"></span>
           </button>
 
-          <!-- Side emergency nub — right edge, decorative -->
-          <div class="apx-emergency-nub" aria-hidden="true"></div>
+          <!-- Side emergency nub — right edge. Raises an emergency broadcast. -->
+          <button
+            type="button"
+            id="emergencyBtn"
+            class="apx-emergency-nub"
+            title="Emergency broadcast"
+            aria-label="Emergency broadcast"
+            aria-pressed="false"
+          ></button>
 
           <!-- Top housing with knobs and Motorola badge -->
           <div class="apx-top-housing" aria-hidden="true">

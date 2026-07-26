@@ -1375,6 +1375,101 @@ function releasePTT(room, client, reason = "released") {
     pushChannelSnapshot(room, client.channel);
 }
 
+// ── Emergency broadcast ───────────────────────────────────────────────────
+// A latched, room-wide state raised by an operator. While it is up the line is
+// reserved for that operator and the dispatchers, and every client is alarmed.
+// Dispatchers are the master of the radio system, so they may also clear it.
+
+function isDispatcher(client) {
+    return Boolean(client) && STAFF_RANKS.has(client.rank);
+}
+
+/// True when this client is allowed to key up during an active emergency.
+function mayTransmitDuringEmergency(room, client) {
+    if (!room.emergency) {
+        return true;
+    }
+    return client.id === room.emergency.operatorId || isDispatcher(client);
+}
+
+function broadcastEmergencyState(room) {
+    const e = room.emergency;
+    broadcastRoom(room, {
+        type: "emergency-state",
+        payload: e
+            ? {
+                  active: true,
+                  operatorId: e.operatorId,
+                  operatorName: e.operatorName,
+                  trainId: e.trainId,
+                  channel: e.channel,
+                  since: e.startedAt,
+              }
+            : { active: false },
+    });
+}
+
+function setEmergency(room, client, active) {
+    if (active) {
+        if (room.emergency) {
+            // Already raised; re-broadcast so a late joiner or a client that missed
+            // the first alarm is brought into step.
+            broadcastEmergencyState(room);
+            return;
+        }
+
+        room.emergency = {
+            operatorId: client.id,
+            operatorName: client.name,
+            trainId: client.trainId,
+            channel: client.channel,
+            startedAt: Date.now(),
+        };
+
+        // Override whoever holds the line, ignoring the usual interrupt window.
+        const channelState = getChannelState(room, client.channel);
+        if (channelState && channelState.holderId !== client.id) {
+            const previousHolder = clientsById.get(channelState.holderId);
+            if (previousHolder && previousHolder.ws.readyState === WebSocket.OPEN) {
+                send(previousHolder.ws, {
+                    type: "ptt-revoked",
+                    payload: { channel: client.channel, reason: "emergency" },
+                });
+            }
+            if (channelState.holderId) {
+                pushTxState(room, channelState.holderId, client.channel, false);
+            }
+            channelState.queue = [];
+            channelState.holderId = null;
+            channelState.grantedAt = 0;
+            pushChannelSnapshot(room, client.channel);
+        }
+
+        broadcastEmergencyState(room);
+        return;
+    }
+
+    if (!room.emergency) {
+        return;
+    }
+
+    // Only the operator who raised it, or a dispatcher, may stand it down.
+    if (room.emergency.operatorId !== client.id && !isDispatcher(client)) {
+        send(client.ws, {
+            type: "error",
+            payload: { message: "Only the raising operator or a dispatcher can clear an emergency." },
+        });
+        return;
+    }
+
+    const raiser = clientsById.get(room.emergency.operatorId);
+    room.emergency = null;
+    if (raiser) {
+        releasePTT(room, raiser, "emergency-cleared");
+    }
+    broadcastEmergencyState(room);
+}
+
 function requestPTT(room, client, channelName) {
     if (!CHANNELS.includes(channelName)) {
         send(client.ws, {
@@ -1387,6 +1482,16 @@ function requestPTT(room, client, channelName) {
     client.channel = channelName;
     const channelState = getChannelState(room, channelName);
     if (!channelState) {
+        return;
+    }
+
+    // While an emergency is up the line belongs to the raising operator and the
+    // dispatchers; everybody else is locked out of transmitting (they still hear it).
+    if (!mayTransmitDuringEmergency(room, client)) {
+        send(client.ws, {
+            type: "ptt-denied",
+            payload: { channel: channelName, reason: "emergency" },
+        });
         return;
     }
 
@@ -2189,6 +2294,17 @@ wss.on("connection", (ws, req) => {
                     isAdmin: rank === "admin",
                     isMod: rank === "mod",
                     isT1: rank === "t1",
+                    // So a client joining mid-emergency is alarmed straight away.
+                    emergency: room.emergency
+                        ? {
+                              active: true,
+                              operatorId: room.emergency.operatorId,
+                              operatorName: room.emergency.operatorName,
+                              trainId: room.emergency.trainId,
+                              channel: room.emergency.channel,
+                              since: room.emergency.startedAt,
+                          }
+                        : { active: false },
                 },
             });
 
@@ -2321,6 +2437,18 @@ wss.on("connection", (ws, req) => {
             return;
         }
 
+        if (type === "emergency-set") {
+            if (client.rank === "t1") {
+                send(client.ws, {
+                    type: "error",
+                    payload: { message: "T1 rank cannot raise an emergency." },
+                });
+                return;
+            }
+            setEmergency(room, client, Boolean(payload.active));
+            return;
+        }
+
         if (type === "ptt-request") {
             if (client.rank === "t1") {
                 send(client.ws, {
@@ -2414,6 +2542,13 @@ wss.on("connection", (ws, req) => {
             type: "peer-left",
             payload: { id: client.id },
         });
+
+        // An emergency dies with the operator who raised it, otherwise the room
+        // would stay locked down with nobody able to stand it down.
+        if (room.emergency && room.emergency.operatorId === client.id) {
+            room.emergency = null;
+            broadcastEmergencyState(room);
+        }
 
         for (const channelName of CHANNELS) {
             pushChannelSnapshot(room, channelName);

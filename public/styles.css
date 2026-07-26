@@ -280,6 +280,84 @@ body {
   border-radius: 4px 6px 6px 4px;
   border: 1px solid #600e00;
   box-shadow: 2px 0 5px rgba(0,0,0,0.4);
+  padding: 0;
+  cursor: pointer;
+}
+
+.apx-emergency-nub:hover {
+  background: linear-gradient(180deg, #d85a2c 0%, #a52a16 100%);
+}
+
+.apx-emergency-nub:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+/* Latched: pulses for as long as the emergency is up. */
+.apx-emergency-nub.active {
+  background: linear-gradient(180deg, #ff5b3a 0%, #d01c00 100%);
+  animation: apx-emergency-pulse 0.7s ease-in-out infinite;
+}
+
+@keyframes apx-emergency-pulse {
+  0%, 100% { box-shadow: 2px 0 5px rgba(0,0,0,0.4); }
+  50% { box-shadow: 0 0 14px 4px rgba(255, 70, 40, 0.95); }
+}
+
+/* Room-wide alarm banner */
+.apx-emergency-banner {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 10px 0;
+  padding: 10px 14px;
+  border: 2px solid #ff4a28;
+  border-radius: 8px;
+  background: rgba(120, 16, 0, 0.92);
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  animation: apx-emergency-flash 0.8s steps(2, end) infinite;
+}
+
+.apx-emergency-banner.visible {
+  display: flex;
+}
+
+.apx-emergency-banner .who {
+  font-weight: 400;
+  opacity: 0.9;
+}
+
+/* Red microphone marking the emergency, on a dark disc so it stays legible
+   against the banner's red background. */
+.apx-emergency-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.apx-emergency-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: #ff4230;
+  stroke: #ff4230;
+}
+
+@keyframes apx-emergency-flash {
+  0% { background: rgba(120, 16, 0, 0.92); }
+  50% { background: rgba(190, 30, 0, 0.96); }
+  100% { background: rgba(120, 16, 0, 0.92); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .apx-emergency-nub.active,
+  .apx-emergency-banner { animation: none; }
 }
 
 /* ── Top housing ── */
