@@ -60,6 +60,18 @@ const DEFAULT_CHANNEL = "operators";
 // Set ALLOW_ANONYMOUS_WS=true in your .env to enable.
 const ALLOW_ANONYMOUS_WS =
     String(process.env.ALLOW_ANONYMOUS_WS || "").toLowerCase() === "true";
+// How long one operator may hold a channel before another operator's PTT request
+// takes it from them, instead of being queued behind it. This is a floor on the
+// interruption, not a hard transmission limit — a holder is never cut off unless
+// somebody else actually wants the line. Set to 0 to disable interruption entirely.
+const PTT_INTERRUPT_SECONDS = (() => {
+    const raw = Number(process.env.PTT_INTERRUPT_SECONDS);
+    if (!Number.isFinite(raw) || raw < 0) {
+        return 35;
+    }
+    return raw;
+})();
+
 const CHANNELS = ["operators", "a1-irt", "b1-bmt", "b2-ind", "y-yard"];
 const RESTRICTED_CHANNELS = new Set(["a1-irt", "b1-bmt", "b2-ind", "y-yard"]);
 const CHANNEL_LABELS = {
@@ -1126,6 +1138,7 @@ function getRoom(roomId) {
                     name,
                     {
                         holderId: null,
+                        grantedAt: 0,
                         queue: [],
                     },
                 ]),
@@ -1155,6 +1168,7 @@ function createRoom(roomId, creatorId, creatorName, roomName) {
                 name,
                 {
                     holderId: null,
+                    grantedAt: 0,
                     queue: [],
                 },
             ]),
@@ -1323,6 +1337,7 @@ function releasePTT(room, client, reason = "released") {
 
     if (channelState.holderId === client.id) {
         channelState.holderId = null;
+        channelState.grantedAt = 0;
 
         send(client.ws, {
             type: "ptt-released",
@@ -1343,6 +1358,7 @@ function releasePTT(room, client, reason = "released") {
             }
 
             channelState.holderId = nextClient.id;
+            channelState.grantedAt = Date.now();
             send(nextClient.ws, {
                 type: "ptt-granted",
                 payload: {
@@ -1376,12 +1392,59 @@ function requestPTT(room, client, channelName) {
 
     if (!channelState.holderId || channelState.holderId === client.id) {
         channelState.holderId = client.id;
+        channelState.grantedAt = Date.now();
 
         send(client.ws, {
             type: "ptt-granted",
             payload: {
                 channel: channelName,
                 reason: "free-channel",
+            },
+        });
+
+        pushTxState(room, client.id, channelName, true);
+        pushChannelSnapshot(room, channelName);
+        return;
+    }
+
+    // The channel is held by somebody else. Once they have blocked the line for
+    // longer than the configured limit, take it from them rather than queueing,
+    // so one stuck or over-long transmission cannot hold the channel forever.
+    const heldForMs = channelState.grantedAt
+        ? Date.now() - channelState.grantedAt
+        : 0;
+    if (
+        PTT_INTERRUPT_SECONDS > 0 &&
+        heldForMs >= PTT_INTERRUPT_SECONDS * 1000
+    ) {
+        const previousHolder = clientsById.get(channelState.holderId);
+
+        channelState.queue = channelState.queue.filter(
+            (id) => id !== client.id && id !== channelState.holderId,
+        );
+
+        if (previousHolder && previousHolder.ws.readyState === WebSocket.OPEN) {
+            send(previousHolder.ws, {
+                type: "ptt-revoked",
+                payload: {
+                    channel: channelName,
+                    reason: "interrupted",
+                    heldSeconds: Math.round(heldForMs / 1000),
+                },
+            });
+        }
+        // Close out the old transmission before opening the new one, so listeners
+        // see a clean stop/start rather than the speaker appearing to change mid-air.
+        pushTxState(room, channelState.holderId, channelName, false);
+
+        channelState.holderId = client.id;
+        channelState.grantedAt = Date.now();
+
+        send(client.ws, {
+            type: "ptt-granted",
+            payload: {
+                channel: channelName,
+                reason: "interrupted-previous",
             },
         });
 
@@ -1926,7 +1989,10 @@ for (const r of stmts.getRooms.all()) {
             members: new Map(),
             clients: new Set(),
             channels: new Map(
-                CHANNELS.map((name) => [name, { holderId: null, queue: [] }]),
+                CHANNELS.map((name) => [
+                    name,
+                    { holderId: null, grantedAt: 0, queue: [] },
+                ]),
             ),
         };
         rooms.set(r.id, room);
@@ -2356,6 +2422,7 @@ wss.on("connection", (ws, req) => {
         if (room.clients.size === 0) {
             for (const channelState of room.channels.values()) {
                 channelState.holderId = null;
+                channelState.grantedAt = 0;
                 channelState.queue = [];
             }
         }

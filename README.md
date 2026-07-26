@@ -7,6 +7,8 @@ A Node.js WebRTC signaling server and demo client that simulates subway radio be
 - WebRTC peer mesh voice with WebSocket signaling.
 - One fixed room (`mta-main`) and one fixed radio channel (`operations`).
 - Push-to-talk arbitration with queueing (single active transmitter).
+- Long transmissions can be interrupted once the holder has blocked the line for
+  `PTT_INTERRUPT_SECONDS` (default 35, `0` disables).
 - Two roles: `operator` and `tower`.
 - Server-generated user names.
 - Mobile-friendly PTT behavior and walkie-talkie style audio processing.
