@@ -27,6 +27,25 @@
         <p>Portable radio for OpenBVE multiplayer &nbsp;·&nbsp; <span id="loggedInUser" style="color:#d4a018"></span> &nbsp;<button id="adminPageBtn" type="button" hidden style="background:none;border:none;color:#88aacc;cursor:pointer;font-size:0.8rem;padding:0;text-decoration:underline;">Admin Page</button> &nbsp;<button id="logoutBtn" type="button" style="background:none;border:none;color:#888;cursor:pointer;font-size:0.8rem;padding:0;text-decoration:underline;">Logout</button></p>
       </section>
 
+      <!-- Private one-to-one call -->
+      <div class="apx-call-bar" id="callBar">
+        <span class="apx-call-status" id="callStatus">Private call</span>
+        <input
+          type="text"
+          id="callTidInput"
+          class="apx-call-tid"
+          inputmode="numeric"
+          pattern="[0-9]*"
+          maxlength="4"
+          placeholder="TID"
+          aria-label="Unit TID to call"
+        />
+        <button type="button" id="callBtn" class="apx-call-btn">Call</button>
+        <button type="button" id="callAnswerBtn" class="apx-call-btn answer" hidden>Answer</button>
+        <button type="button" id="callDeclineBtn" class="apx-call-btn decline" hidden>Decline</button>
+        <button type="button" id="callEndBtn" class="apx-call-btn end" hidden>Hang up</button>
+      </div>
+
       <!-- Room-wide emergency alarm -->
       <div
         class="apx-emergency-banner"

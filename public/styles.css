@@ -304,6 +304,60 @@ body {
   50% { box-shadow: 0 0 14px 4px rgba(255, 70, 40, 0.95); }
 }
 
+/* ── Private one-to-one call bar ── */
+.apx-call-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px 0;
+  padding: 8px 12px;
+  border: 1px solid #2f3a46;
+  border-radius: 8px;
+  background: rgba(18, 24, 32, 0.9);
+  color: #cfd8e3;
+  font-size: 0.85rem;
+}
+
+/* Lit while a call is ringing or up. */
+.apx-call-bar.engaged {
+  border-color: #4f8fd0;
+  background: rgba(20, 42, 66, 0.95);
+  color: #e8f2ff;
+}
+
+.apx-call-status {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.apx-call-tid {
+  width: 70px;
+  padding: 4px 8px;
+  border: 1px solid #3a4655;
+  border-radius: 5px;
+  background: #0f141a;
+  color: #e8f2ff;
+  font: inherit;
+  text-align: center;
+  letter-spacing: 0.12em;
+}
+
+.apx-call-btn {
+  padding: 5px 12px;
+  border: 1px solid #3a4655;
+  border-radius: 5px;
+  background: #1d2733;
+  color: #cfd8e3;
+  font: inherit;
+  cursor: pointer;
+}
+
+.apx-call-btn:hover:not(:disabled) { background: #27333f; }
+.apx-call-btn:disabled { opacity: 0.45; cursor: default; }
+.apx-call-btn.answer { background: #1c4a2a; border-color: #2f7b46; color: #d8ffe4; }
+.apx-call-btn.decline,
+.apx-call-btn.end { background: #4a1c1c; border-color: #7b2f2f; color: #ffd8d8; }
+
 /* Room-wide alarm banner */
 .apx-emergency-banner {
   display: none;

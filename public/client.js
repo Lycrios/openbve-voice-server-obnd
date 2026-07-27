@@ -38,6 +38,12 @@ const state = {
   isPttPressed: false,
   /// Active room emergency, or null. Mirrors the server's emergency-state.
   emergency: null,
+  /// Private call as { stage: "ringing"|"incoming"|"active", peer }, or null.
+  call: null,
+  /// Cloned mic stream feeding relay capture, independent of the mesh track.
+  relayStream: null,
+  /// Last call refusal from the server, shown in the call bar.
+  callMessage: "",
   powerMode: "off",
   micAnalyserNode: null,
   micAnalyserSourceNode: null,
@@ -107,6 +113,13 @@ const adminPageBtn = document.getElementById("adminPageBtn");
 const leaveServerBtn = document.getElementById("leaveServerBtn");
 const pttBtn = document.getElementById("pttBtn");
 const cleanCheckBtn = document.getElementById("cleanCheckBtn");
+const callBar = document.getElementById("callBar");
+const callStatus = document.getElementById("callStatus");
+const callTidInput = document.getElementById("callTidInput");
+const callBtn = document.getElementById("callBtn");
+const callAnswerBtn = document.getElementById("callAnswerBtn");
+const callDeclineBtn = document.getElementById("callDeclineBtn");
+const callEndBtn = document.getElementById("callEndBtn");
 const emergencyBtn = document.getElementById("emergencyBtn");
 const emergencyBanner = document.getElementById("emergencyBanner");
 const emergencyWho = document.getElementById("emergencyWho");
@@ -285,6 +298,21 @@ function routePeerAudio(peer, isActiveSpeaker) {
     }
   };
   const isRelayPeer = peer.transport === "relay";
+
+  // On a private call only the other party is audible. The room's WebRTC audio
+  // arrives peer-to-peer, so the server cannot gate it — we silence it here.
+  if (isInPrivateCall()) {
+    const callPeerId = state.call.peer ? state.call.peer.id : null;
+    if (peer.id !== callPeerId) {
+      peer.audio.muted = true;
+      peer.audio.volume = 0;
+      if (peer.peerGainNode) {
+        peer.peerGainNode.gain.value = 0;
+      }
+      setCleanGain(0);
+      return;
+    }
+  }
 
   // Half-duplex behavior: while transmitting, do not monitor inbound audio.
   if (state.isPttPressed) {
@@ -560,7 +588,10 @@ async function switchMicrophone(deviceId) {
 
     state.localStream = newStream;
     state.localTrack = newTrack;
-    state.localTrack.enabled = state.txGranted;
+    // Drop the old clone so relay capture picks up the new device.
+    releaseRelayCaptureStream();
+    stopRelayCapture();
+    applyTransmitRouting();
     setStatus("Microphone updated");
   } catch (_err) {
     setStatus("Failed to switch microphone");
@@ -1403,6 +1434,104 @@ function connectPeerAudio(peer, stream) {
   peer.sourceNode.connect(peer.peerGainNode);
 }
 
+/* ── PRIVATE ONE-TO-ONE CALL ───────────────────────────────────────────
+ * Strictly two parties. While a call is up both ends are off the room
+ * channel: audio goes only to the peer, and the room is neither heard nor
+ * transmitted to. The server enforces all of that; this is the console for it.
+ * ─────────────────────────────────────────────────────────────────────── */
+function callStateName() {
+  return state.call ? state.call.stage : "none";
+}
+
+function isInPrivateCall() {
+  return callStateName() === "active";
+}
+
+function renderCallBar() {
+  if (!callBar) {
+    return;
+  }
+
+  const stage = callStateName();
+  const peer = state.call && state.call.peer ? state.call.peer : null;
+  const peerLabel = peer
+    ? peer.trainId
+      ? `Train ${peer.trainId}`
+      : peer.name || "unit"
+    : "";
+
+  const engaged = stage !== "none";
+  callBar.classList.toggle("engaged", engaged);
+
+  if (callStatus) {
+    if (stage === "incoming") callStatus.textContent = `${peerLabel} calling`;
+    else if (stage === "ringing") callStatus.textContent = `Calling ${peerLabel}…`;
+    else if (stage === "active") callStatus.textContent = `Private call — ${peerLabel}`;
+    else callStatus.textContent = state.callMessage || "Private call";
+  }
+
+  // Only the controls that make sense for the current stage.
+  if (callTidInput) callTidInput.hidden = engaged;
+  if (callBtn) {
+    callBtn.hidden = engaged;
+    callBtn.disabled = !state.ws || state.ws.readyState !== WebSocket.OPEN;
+  }
+  if (callAnswerBtn) callAnswerBtn.hidden = stage !== "incoming";
+  if (callDeclineBtn) callDeclineBtn.hidden = stage !== "incoming";
+  if (callEndBtn) callEndBtn.hidden = stage !== "ringing" && stage !== "active";
+}
+
+function setCallState(stage, peer) {
+  const wasActive = isInPrivateCall();
+  state.call = stage === "none" ? null : { stage, peer: peer || null };
+  const nowActive = isInPrivateCall();
+
+  if (nowActive !== wasActive) {
+    // A private call is carried entirely by the relay, so the mesh track stays
+    // disabled for the duration — see applyTransmitRouting.
+    applyTransmitRouting();
+    if (!nowActive) {
+      stopRelayCapture();
+    }
+    applyCurrentMonitorRouting();
+  }
+
+  renderCallBar();
+}
+
+function placePrivateCall() {
+  if (!callTidInput) {
+    return;
+  }
+  const trainId = callTidInput.value.replace(/[^0-9]/g, "").slice(0, 4);
+  if (trainId.length !== 4) {
+    state.callMessage = "Enter a 4-digit TID";
+    renderCallBar();
+    return;
+  }
+  state.callMessage = "";
+  wsSend("private-call-request", { trainId });
+}
+
+if (callBtn) callBtn.addEventListener("click", placePrivateCall);
+if (callTidInput) {
+  callTidInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      placePrivateCall();
+    }
+  });
+}
+if (callAnswerBtn) {
+  callAnswerBtn.addEventListener("click", () => wsSend("private-call-accept", {}));
+}
+if (callDeclineBtn) {
+  callDeclineBtn.addEventListener("click", () => wsSend("private-call-decline", {}));
+}
+if (callEndBtn) {
+  callEndBtn.addEventListener("click", () => wsSend("private-call-end", {}));
+}
+
 /* ── EMERGENCY BROADCAST ───────────────────────────────────────────────
  * A latched, room-wide state raised from the side nub. While it is up the
  * server reserves the line for the raising operator and the dispatchers, and
@@ -1660,15 +1789,57 @@ function resampleToRelayPcm(input, inputRate) {
   return out;
 }
 
+/**
+ * A clone of the microphone track, used only for relay capture.
+ *
+ * The clone carries its own `enabled` flag, so disabling the mesh track during a
+ * private call silences WebRTC without silencing the relay — which is what makes
+ * the call private and audible at the same time.
+ */
+function ensureRelayCaptureStream() {
+  if (!state.localTrack) {
+    return null;
+  }
+  const live =
+    state.relayStream &&
+    state.relayStream.getAudioTracks().length > 0 &&
+    state.relayStream.getAudioTracks()[0].readyState === "live";
+  if (!live) {
+    releaseRelayCaptureStream();
+    try {
+      state.relayStream = new MediaStream([state.localTrack.clone()]);
+    } catch (_err) {
+      // Cloning unsupported; fall back to the mesh track. The call still works,
+      // it just cannot be transmitted while the mesh track is muted.
+      state.relayStream = state.localStream;
+    }
+  }
+  return state.relayStream;
+}
+
+function releaseRelayCaptureStream() {
+  if (state.relayStream && state.relayStream !== state.localStream) {
+    for (const track of state.relayStream.getTracks()) {
+      try {
+        track.stop();
+      } catch (_err) {
+        // Already stopped.
+      }
+    }
+  }
+  state.relayStream = null;
+}
+
 function startRelayCapture() {
-  if (relayCaptureNode || !state.audioCtx || !state.localStream) {
+  const captureStream = ensureRelayCaptureStream();
+  if (relayCaptureNode || !state.audioCtx || !captureStream) {
     return;
   }
 
   const ctx = state.audioCtx;
   relayResampleCarry = 0;
 
-  relayCaptureSource = ctx.createMediaStreamSource(state.localStream);
+  relayCaptureSource = ctx.createMediaStreamSource(captureStream);
 
   // Anti-alias before decimating to 16 kHz (8 kHz Nyquist).
   relayCaptureFilter = ctx.createBiquadFilter();
@@ -2221,6 +2392,8 @@ function ensurePeer(peerInfo) {
   const pc = transport === "relay" ? null : new RTCPeerConnection(stunConfig);
 
   if (pc && state.localStream) {
+    // Safe to attach even mid-call: the track's own enabled flag keeps the mesh
+    // silent for the duration, so a peer joining part-way cannot open the call up.
     for (const track of state.localStream.getTracks()) {
       pc.addTrack(track, state.localStream);
     }
@@ -2336,8 +2509,11 @@ function applyTxState(payload) {
   state.activeChannel = payload.active ? payload.channel : null;
   let isReceivingAudio = false;
 
-  // Only listen if we're on the same channel as the speaker
-  const isListenerOnChannel = state.selectedChannel === payload.channel;
+  // Only listen if we're on the same channel as the speaker. Private-call traffic
+  // is addressed to the two parties directly rather than to a channel, so it is
+  // always for us when it arrives.
+  const isListenerOnChannel =
+    payload.private === true || state.selectedChannel === payload.channel;
 
   for (const [peerId, peer] of state.peers.entries()) {
     if (payload.active && peerId === payload.speakerId && isListenerOnChannel) {
@@ -2376,15 +2552,28 @@ function applyTxState(payload) {
   }
 }
 
+/**
+ * Points our microphone at whichever transport should carry it.
+ *
+ * On a private call the mesh track stays off for the whole call: the audio is
+ * relayed through the voice server to the one other party. WebRTC is peer-to-peer,
+ * so the server cannot keep a call off the mesh for us — we simply never feed it.
+ * Relay capture reads a cloned track, so muting the mesh does not mute the call.
+ */
+function applyTransmitRouting() {
+  if (state.localTrack) {
+    state.localTrack.enabled = state.txGranted && !isInPrivateCall();
+  }
+}
+
 function setTx(enabled) {
   state.txGranted = enabled;
-  if (state.localTrack) {
-    state.localTrack.enabled = enabled;
-  }
+  applyTransmitRouting();
 
   // Mirror the transmission onto the PCM relay so relay-only peers (the in-game
-  // client) can hear it. WebRTC peers are already covered by the mesh.
-  if (enabled && hasRelayPeersOnChannel()) {
+  // client) can hear it. WebRTC peers are already covered by the mesh — except
+  // on a private call, where the relay is the only path to the other party.
+  if (enabled && (isInPrivateCall() || hasRelayPeersOnChannel())) {
     startRelayCapture();
   } else if (!enabled) {
     stopRelayCapture();
@@ -2639,8 +2828,9 @@ async function join(roomId, userName) {
 
   state.ws.onclose = (event) => {
     setPowerState("off");
-    // Never leave the alarm sounding once we are off the air.
+    // Never leave the alarm sounding or a call showing once we are off the air.
     applyEmergencyState(null);
+    setCallState("none", null);
     setServerStatus("Server: checking...");
     const closeCode = event && typeof event.code === "number" ? event.code : 0;
     const closeReason = event && event.reason ? ` (${event.reason})` : "";
@@ -2730,6 +2920,7 @@ async function join(roomId, userName) {
 
       // Pick up an emergency already in progress, so joining mid-alarm still alarms.
       applyEmergencyState(msg.payload.emergency);
+      renderCallBar();
 
       // Setup available channels from server
       if (Array.isArray(msg.payload.channels)) {
@@ -2932,6 +3123,34 @@ async function join(roomId, userName) {
 
     if (msg.type === "emergency-state") {
       applyEmergencyState(msg.payload);
+      return;
+    }
+
+    if (msg.type === "private-call-ringing") {
+      state.callMessage = "";
+      setCallState("ringing", msg.payload.peer);
+      return;
+    }
+    if (msg.type === "private-call-incoming") {
+      state.callMessage = "";
+      setCallState("incoming", msg.payload.peer);
+      playSquelchOpen();
+      return;
+    }
+    if (msg.type === "private-call-started") {
+      state.callMessage = "";
+      setCallState("active", msg.payload.peer);
+      setChannelState("PRIVATE CALL");
+      return;
+    }
+    if (msg.type === "private-call-ended") {
+      setCallState("none", null);
+      setChannelState("Channel idle");
+      return;
+    }
+    if (msg.type === "private-call-failed") {
+      state.callMessage = msg.payload.message || "Call failed";
+      setCallState("none", null);
       return;
     }
 

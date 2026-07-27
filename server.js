@@ -1375,6 +1375,232 @@ function releasePTT(room, client, reason = "released") {
     pushChannelSnapshot(room, client.channel);
 }
 
+// ── Private one-to-one calls ──────────────────────────────────────────────
+// A private call is strictly two parties. While one is up, both drop off the
+// room channel entirely: their audio goes only to each other, and they neither
+// hear nor are heard by the rest of the room. PTT arbitration runs per call.
+
+const privateCalls = new Map();
+let nextPrivateCallId = 1;
+
+function getCall(client) {
+    return client && client.privateCallId
+        ? privateCalls.get(client.privateCallId) || null
+        : null;
+}
+
+function isInActiveCall(client) {
+    const call = getCall(client);
+    return Boolean(call && call.active);
+}
+
+/// The other party, or null when there is no active call.
+function activeCallPeer(client) {
+    const call = getCall(client);
+    if (!call || !call.active) {
+        return null;
+    }
+    const peerId = call.participants.find((id) => id !== client.id);
+    return clientsById.get(peerId) || null;
+}
+
+function callParty(c) {
+    return c ? { id: c.id, name: c.name, trainId: c.trainId } : null;
+}
+
+/// tx-state for a call goes only to its two parties, never to the room.
+function pushCallTxState(call, speakerId, active) {
+    for (const id of call.participants) {
+        const party = clientsById.get(id);
+        if (!party || party.ws.readyState !== WebSocket.OPEN) {
+            continue;
+        }
+        send(party.ws, {
+            type: "tx-state",
+            payload: { active, speakerId, channel: "private", private: true },
+        });
+    }
+}
+
+function findClientByTrainId(room, trainId) {
+    const wanted = String(trainId || "").trim();
+    if (!wanted) {
+        return null;
+    }
+    for (const id of room.clients) {
+        const candidate = clientsById.get(id);
+        if (candidate && String(candidate.trainId) === wanted) {
+            return candidate;
+        }
+    }
+    return null;
+}
+
+function endPrivateCall(callId, reason) {
+    const call = privateCalls.get(callId);
+    if (!call) {
+        return;
+    }
+    privateCalls.delete(callId);
+
+    if (call.active && call.holderId) {
+        pushCallTxState(call, call.holderId, false);
+    }
+
+    for (const id of call.participants) {
+        const party = clientsById.get(id);
+        if (!party) {
+            continue;
+        }
+        party.privateCallId = null;
+        if (party.ws.readyState === WebSocket.OPEN) {
+            send(party.ws, {
+                type: "private-call-ended",
+                payload: { callId, reason },
+            });
+        }
+    }
+}
+
+/// Drops whatever call this client is in, if any. Used on hang-up, disconnect,
+/// and whenever something outranks the call (an emergency).
+function clearPrivateCallFor(client, reason) {
+    if (client && client.privateCallId) {
+        endPrivateCall(client.privateCallId, reason);
+    }
+}
+
+function requestPrivateCall(room, client, targetTrainId) {
+    const fail = (message) =>
+        send(client.ws, { type: "private-call-failed", payload: { message } });
+
+    if (client.rank === "t1") {
+        fail("T1 rank cannot place private calls.");
+        return;
+    }
+    if (getCall(client)) {
+        fail("You are already on a private call.");
+        return;
+    }
+
+    const target = findClientByTrainId(room, targetTrainId);
+    if (!target) {
+        fail("No unit with TID " + targetTrainId + " on this room.");
+        return;
+    }
+    if (target.id === client.id) {
+        fail("You cannot call yourself.");
+        return;
+    }
+    // One-to-one only: a unit already on a call cannot be pulled into another.
+    if (getCall(target)) {
+        fail("Unit " + target.trainId + " is busy.");
+        return;
+    }
+    if (target.rank === "t1") {
+        fail("Unit " + target.trainId + " cannot take private calls.");
+        return;
+    }
+
+    const callId = "pc" + nextPrivateCallId++;
+    const call = {
+        id: callId,
+        roomId: room.id,
+        participants: [client.id, target.id],
+        callerId: client.id,
+        active: false,
+        holderId: null,
+        grantedAt: 0,
+        createdAt: Date.now(),
+    };
+    privateCalls.set(callId, call);
+    client.privateCallId = callId;
+    target.privateCallId = callId;
+
+    send(client.ws, {
+        type: "private-call-ringing",
+        payload: { callId, peer: callParty(target) },
+    });
+    send(target.ws, {
+        type: "private-call-incoming",
+        payload: { callId, peer: callParty(client) },
+    });
+}
+
+function answerPrivateCall(room, client, accept) {
+    const call = getCall(client);
+    if (!call || call.active) {
+        return;
+    }
+    // Only the party who was rung may answer.
+    if (call.callerId === client.id) {
+        return;
+    }
+
+    if (!accept) {
+        endPrivateCall(call.id, "declined");
+        return;
+    }
+
+    // Leaving the room channel: drop any hold either party has on it, so the
+    // main channel is not left blocked by somebody who has stepped away.
+    for (const id of call.participants) {
+        const party = clientsById.get(id);
+        if (party) {
+            releasePTT(room, party, "private-call");
+        }
+    }
+
+    call.active = true;
+    for (const id of call.participants) {
+        const party = clientsById.get(id);
+        const peer = clientsById.get(call.participants.find((p) => p !== id));
+        if (party && party.ws.readyState === WebSocket.OPEN) {
+            send(party.ws, {
+                type: "private-call-started",
+                payload: { callId: call.id, peer: callParty(peer) },
+            });
+        }
+    }
+}
+
+/// PTT inside a private call, arbitrated per call rather than per channel.
+function privateCallPtt(client, pressed) {
+    const call = getCall(client);
+    if (!call || !call.active) {
+        return false;
+    }
+
+    if (pressed) {
+        if (!call.holderId || call.holderId === client.id) {
+            call.holderId = client.id;
+            call.grantedAt = Date.now();
+            send(client.ws, {
+                type: "ptt-granted",
+                payload: { channel: "private", reason: "private-call" },
+            });
+            pushCallTxState(call, client.id, true);
+        } else {
+            send(client.ws, {
+                type: "ptt-denied",
+                payload: { channel: "private", reason: "peer-transmitting" },
+            });
+        }
+        return true;
+    }
+
+    if (call.holderId === client.id) {
+        call.holderId = null;
+        call.grantedAt = 0;
+        send(client.ws, {
+            type: "ptt-released",
+            payload: { reason: "released" },
+        });
+        pushCallTxState(call, client.id, false);
+    }
+    return true;
+}
+
 // ── Emergency broadcast ───────────────────────────────────────────────────
 // A latched, room-wide state raised by an operator. While it is up the line is
 // reserved for that operator and the dispatchers, and every client is alarmed.
@@ -1417,6 +1643,10 @@ function setEmergency(room, client, active) {
             broadcastEmergencyState(room);
             return;
         }
+
+        // An emergency overrides all communications, private calls included — the
+        // raiser needs to be on the open channel, not tied up one-to-one.
+        clearPrivateCallFor(client, "emergency");
 
         room.emergency = {
             operatorId: client.id,
@@ -2116,6 +2346,7 @@ wss.on("connection", (ws, req) => {
         trainId: "",
         channel: DEFAULT_CHANNEL,
         transport: "webrtc",
+        privateCallId: null,
         wsUrl: req.url,
         wsHeaders: req.headers,
     };
@@ -2123,6 +2354,19 @@ wss.on("connection", (ws, req) => {
     ws.on("message", (raw, isBinary) => {
         // Binary = PCM audio frame from the current PTT holder → relay to channel peers
         if (isBinary) {
+            // On a private call the audio goes to the other party and nowhere else.
+            const call = getCall(client);
+            if (call && call.active) {
+                if (call.holderId !== client.id) {
+                    return;
+                }
+                const peer = activeCallPeer(client);
+                if (peer && peer.ws.readyState === WebSocket.OPEN) {
+                    peer.ws.send(raw, { binary: true });
+                }
+                return;
+            }
+
             if (client.roomId) {
                 const room = rooms.get(client.roomId);
                 if (room) {
@@ -2137,6 +2381,10 @@ wss.on("connection", (ws, req) => {
                                 listener.channel !== client.channel ||
                                 listener.ws.readyState !== WebSocket.OPEN
                             ) {
+                                continue;
+                            }
+                            // Anyone on a private call has stepped off the channel.
+                            if (isInActiveCall(listener)) {
                                 continue;
                             }
                             // When both ends speak WebRTC the peer mesh already carries
@@ -2437,6 +2685,26 @@ wss.on("connection", (ws, req) => {
             return;
         }
 
+        if (type === "private-call-request") {
+            requestPrivateCall(room, client, payload.trainId);
+            return;
+        }
+
+        if (type === "private-call-accept") {
+            answerPrivateCall(room, client, true);
+            return;
+        }
+
+        if (type === "private-call-decline") {
+            answerPrivateCall(room, client, false);
+            return;
+        }
+
+        if (type === "private-call-end") {
+            clearPrivateCallFor(client, "hung-up");
+            return;
+        }
+
         if (type === "emergency-set") {
             if (client.rank === "t1") {
                 send(client.ws, {
@@ -2450,6 +2718,10 @@ wss.on("connection", (ws, req) => {
         }
 
         if (type === "ptt-request") {
+            // On a private call the key is arbitrated within the call, not the channel.
+            if (privateCallPtt(client, true)) {
+                return;
+            }
             if (client.rank === "t1") {
                 send(client.ws, {
                     type: "error",
@@ -2508,6 +2780,9 @@ wss.on("connection", (ws, req) => {
         }
 
         if (type === "ptt-release") {
+            if (privateCallPtt(client, false)) {
+                return;
+            }
             releasePTT(room, client);
             return;
         }
@@ -2542,6 +2817,9 @@ wss.on("connection", (ws, req) => {
             type: "peer-left",
             payload: { id: client.id },
         });
+
+        // A private call cannot outlive either party.
+        clearPrivateCallFor(client, "peer-disconnected");
 
         // An emergency dies with the operator who raised it, otherwise the room
         // would stay locked down with nobody able to stand it down.
