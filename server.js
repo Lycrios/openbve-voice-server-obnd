@@ -72,15 +72,15 @@ const PTT_INTERRUPT_SECONDS = (() => {
     return raw;
 })();
 
-const CHANNELS = ["operators", "a1-irt", "b1-bmt", "b2-ind", "y-yard"];
-const RESTRICTED_CHANNELS = new Set(["a1-irt", "b1-bmt", "b2-ind", "y-yard"]);
-const CHANNEL_LABELS = {
-    operators: "Operators",
-    "a1-irt": "A1-IRT",
-    "b1-bmt": "B1-BMT",
-    "b2-ind": "B2-IND",
-    "y-yard": "Y-Yard",
-};
+// The channels a fresh database is seeded with. After that the set is owned by
+// the dispatchers — see the radio_channels table and the channel registry below.
+const SEED_CHANNELS = [
+    { id: "operators", label: "Operators", restricted: 0 },
+    { id: "a1-irt", label: "A1-IRT", restricted: 1 },
+    { id: "b1-bmt", label: "B1-BMT", restricted: 1 },
+    { id: "b2-ind", label: "B2-IND", restricted: 1 },
+    { id: "y-yard", label: "Y-Yard", restricted: 1 },
+];
 
 // ── Ranks (stored in DB, determine permissions) ──────────────
 // Hierarchy: admin > mod > t3 > t2 > t1
@@ -136,22 +136,22 @@ function normalizeTransport(value) {
 }
 
 function canAccessChannel(rank, channelId) {
-    if (!RESTRICTED_CHANNELS.has(channelId)) return true;
+    if (!isRestrictedChannel(channelId)) return true;
     return rank === "t3" || rank === "mod" || rank === "admin";
 }
 
 function capChannel(requestedChannel, rank) {
     const ch = String(requestedChannel || DEFAULT_CHANNEL).toLowerCase();
-    if (!CHANNELS.includes(ch)) return DEFAULT_CHANNEL;
+    if (!channelExists(ch)) return DEFAULT_CHANNEL;
     if (!canAccessChannel(rank, ch)) return DEFAULT_CHANNEL;
     return ch;
 }
 
 function getChannelDescriptors(rank) {
-    return CHANNELS.map((ch) => ({
+    return channelIds().map((ch) => ({
         id: ch,
-        label: CHANNEL_LABELS[ch] || ch,
-        restricted: RESTRICTED_CHANNELS.has(ch),
+        label: channelLabel(ch),
+        restricted: isRestrictedChannel(ch),
         allowed: canAccessChannel(rank, ch),
     }));
 }
@@ -191,6 +191,14 @@ db.exec(`
     PRIMARY KEY(user_id, room_id),
     FOREIGN KEY(user_id) REFERENCES users(id),
     FOREIGN KEY(room_id) REFERENCES rooms(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS radio_channels (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    restricted INTEGER NOT NULL DEFAULT 0,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
   );
 `);
 
@@ -258,7 +266,77 @@ const stmts = {
     hasStaffRole: db.prepare(
         "SELECT 1 AS ok FROM user_roles WHERE user_id = ? AND role IN ('admin','mod') LIMIT 1",
     ),
+    getChannels: db.prepare(
+        "SELECT * FROM radio_channels ORDER BY position ASC, created_at ASC",
+    ),
+    getChannelById: db.prepare("SELECT * FROM radio_channels WHERE id = ?"),
+    createChannel: db.prepare(
+        "INSERT INTO radio_channels (id, label, restricted, position) VALUES (?, ?, ?, ?)",
+    ),
+    deleteChannel: db.prepare("DELETE FROM radio_channels WHERE id = ?"),
+    maxChannelPosition: db.prepare(
+        "SELECT COALESCE(MAX(position), 0) AS maxPos FROM radio_channels",
+    ),
 };
+
+// ── Channel registry ──────────────────────────────────────────
+// Channels used to be a hardcoded constant. They are now owned by the
+// dispatchers and persisted, so the in-memory registry is the single source of
+// truth that every room's channel state is built from.
+
+/** @type {Map<string, {id: string, label: string, restricted: boolean}>} */
+const channelRegistry = new Map();
+
+function loadChannelRegistry() {
+    if (stmts.getChannels.all().length === 0) {
+        // Fresh database — lay down the defaults the radio shipped with.
+        let position = 0;
+        for (const seed of SEED_CHANNELS) {
+            stmts.createChannel.run(seed.id, seed.label, seed.restricted, position++);
+        }
+    }
+
+    channelRegistry.clear();
+    for (const row of stmts.getChannels.all()) {
+        channelRegistry.set(row.id, {
+            id: row.id,
+            label: row.label,
+            restricted: Boolean(row.restricted),
+        });
+    }
+}
+
+loadChannelRegistry();
+
+/** Every channel id, in display order. */
+function channelIds() {
+    return [...channelRegistry.keys()];
+}
+
+function channelExists(id) {
+    return channelRegistry.has(id);
+}
+
+function isRestrictedChannel(id) {
+    return Boolean(channelRegistry.get(id)?.restricted);
+}
+
+function channelLabel(id) {
+    return channelRegistry.get(id)?.label || id;
+}
+
+/**
+ * Turns a dispatcher's free text into a channel id: lowercase, spaces and
+ * punctuation collapsed to single hyphens.
+ */
+function slugifyChannelId(value) {
+    return String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 32);
+}
 
 // ── Seed default admin account ────────────────────────────────
 {
@@ -1134,7 +1212,7 @@ function getRoom(roomId) {
             members: new Map(), // userId -> { id, name, role, trainId, line, channel }
             clients: new Set(),
             channels: new Map(
-                CHANNELS.map((name) => [
+                channelIds().map((name) => [
                     name,
                     {
                         holderId: null,
@@ -1164,7 +1242,7 @@ function createRoom(roomId, creatorId, creatorName, roomName) {
         members: new Map(),
         clients: new Set(),
         channels: new Map(
-            CHANNELS.map((name) => [
+            channelIds().map((name) => [
                 name,
                 {
                     holderId: null,
@@ -1373,6 +1451,118 @@ function releasePTT(room, client, reason = "released") {
     }
 
     pushChannelSnapshot(room, client.channel);
+}
+
+// ── Dispatcher channel management ─────────────────────────────────────────
+
+/// Re-sends every client the channel list as it applies to their own rank.
+function broadcastChannelList(room) {
+    for (const id of room.clients) {
+        const member = clientsById.get(id);
+        if (!member || member.ws.readyState !== WebSocket.OPEN) continue;
+        send(member.ws, {
+            type: "channels-updated",
+            payload: { channels: getChannelDescriptors(member.rank) },
+        });
+    }
+}
+
+function createChannel(room, client, payload) {
+    const fail = (message) =>
+        send(client.ws, { type: "error", payload: { message } });
+
+    if (!isDispatcher(client)) {
+        fail("Only dispatchers can create channels.");
+        return;
+    }
+
+    const label = String(payload.label || "").trim().slice(0, 40);
+    if (!label) {
+        fail("A channel needs a name.");
+        return;
+    }
+
+    // The id is derived from the name unless one was given explicitly.
+    const id = slugifyChannelId(payload.id || label);
+    if (!id) {
+        fail("That name has no usable letters or digits.");
+        return;
+    }
+    if (channelExists(id)) {
+        fail("Channel '" + id + "' already exists.");
+        return;
+    }
+
+    const restricted = payload.restricted ? 1 : 0;
+    const position = (stmts.maxChannelPosition.get()?.maxPos ?? 0) + 1;
+
+    try {
+        stmts.createChannel.run(id, label, restricted, position);
+    } catch (err) {
+        fail("Could not create that channel: " + err.message);
+        return;
+    }
+
+    channelRegistry.set(id, { id, label, restricted: Boolean(restricted) });
+
+    // Every room needs PTT state for the new channel, including rooms that are
+    // idle right now, or the first request on it would find no channel state.
+    for (const r of rooms.values()) {
+        if (!r.channels.has(id)) {
+            r.channels.set(id, { holderId: null, grantedAt: 0, queue: [] });
+        }
+    }
+
+    broadcastChannelList(room);
+    pushChannelSnapshot(room, id);
+}
+
+function deleteChannel(room, client, payload) {
+    const fail = (message) =>
+        send(client.ws, { type: "error", payload: { message } });
+
+    if (!isDispatcher(client)) {
+        fail("Only dispatchers can delete channels.");
+        return;
+    }
+
+    const id = slugifyChannelId(payload.id);
+    if (!channelExists(id)) {
+        fail("No such channel.");
+        return;
+    }
+    if (id === DEFAULT_CHANNEL) {
+        fail("The default channel cannot be deleted.");
+        return;
+    }
+
+    stmts.deleteChannel.run(id);
+    channelRegistry.delete(id);
+
+    // Move anyone standing on it back to the default channel, and drop the
+    // per-room state so nothing is left holding a channel that no longer exists.
+    for (const r of rooms.values()) {
+        const state = r.channels.get(id);
+        if (state && state.holderId) {
+            const holder = clientsById.get(state.holderId);
+            if (holder) releasePTT(r, holder, "channel-removed");
+        }
+        r.channels.delete(id);
+
+        for (const memberId of r.clients) {
+            const member = clientsById.get(memberId);
+            if (!member || member.channel !== id) continue;
+            member.channel = DEFAULT_CHANNEL;
+            const record = r.members.get(memberId);
+            if (record) record.channel = DEFAULT_CHANNEL;
+            send(member.ws, {
+                type: "channel-changed",
+                payload: { id: memberId, channel: DEFAULT_CHANNEL },
+            });
+        }
+    }
+
+    broadcastChannelList(room);
 }
 
 // ── Private one-to-one calls ──────────────────────────────────────────────
@@ -1701,7 +1891,7 @@ function setEmergency(room, client, active) {
 }
 
 function requestPTT(room, client, channelName) {
-    if (!CHANNELS.includes(channelName)) {
+    if (!channelExists(channelName)) {
         send(client.ws, {
             type: "error",
             payload: { message: "Unknown channel." },
@@ -2324,7 +2514,7 @@ for (const r of stmts.getRooms.all()) {
             members: new Map(),
             clients: new Set(),
             channels: new Map(
-                CHANNELS.map((name) => [
+                channelIds().map((name) => [
                     name,
                     { holderId: null, grantedAt: 0, queue: [] },
                 ]),
@@ -2565,7 +2755,7 @@ wss.on("connection", (ws, req) => {
                 client.id,
             );
 
-            for (const channelName of CHANNELS) {
+            for (const channelName of channelIds()) {
                 pushChannelSnapshot(room, channelName);
             }
 
@@ -2682,6 +2872,16 @@ wss.on("connection", (ws, req) => {
                     channel: newChannel,
                 },
             });
+            return;
+        }
+
+        if (type === "channel-create") {
+            createChannel(room, client, payload);
+            return;
+        }
+
+        if (type === "channel-delete") {
+            deleteChannel(room, client, payload);
             return;
         }
 
@@ -2828,7 +3028,7 @@ wss.on("connection", (ws, req) => {
             broadcastEmergencyState(room);
         }
 
-        for (const channelName of CHANNELS) {
+        for (const channelName of channelIds()) {
             pushChannelSnapshot(room, channelName);
         }
 
