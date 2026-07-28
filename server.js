@@ -72,6 +72,21 @@ const PTT_INTERRUPT_SECONDS = (() => {
     return raw;
 })();
 
+// How often to ping every connected socket.
+//
+// The `ws` library does not ping on its own, and browsers cannot send pings from
+// JavaScript at all — so an idle radio connection has no traffic whatsoever
+// between transmissions. Behind a reverse proxy (nginx's proxy_read_timeout
+// defaults to 60s) that idle connection gets closed out from under us. Pinging
+// keeps it alive and doubles as dead-peer detection.
+const WS_HEARTBEAT_SECONDS = (() => {
+    const raw = Number(process.env.WS_HEARTBEAT_SECONDS);
+    if (!Number.isFinite(raw) || raw <= 0) {
+        return 30;
+    }
+    return raw;
+})();
+
 // The channels a fresh database is seeded with. After that the set is owned by
 // the dispatchers — see the radio_channels table and the channel registry below.
 const SEED_CHANNELS = [
@@ -2541,6 +2556,12 @@ wss.on("connection", (ws, req) => {
         wsHeaders: req.headers,
     };
 
+    // Heartbeat: flag lives on the socket so the sweep needs no client lookup.
+    ws.isAlive = true;
+    ws.on("pong", () => {
+        ws.isAlive = true;
+    });
+
     ws.on("message", (raw, isBinary) => {
         // Binary = PCM audio frame from the current PTT holder → relay to channel peers
         if (isBinary) {
@@ -3041,6 +3062,31 @@ wss.on("connection", (ws, req) => {
         }
     });
 });
+
+// ── WebSocket heartbeat ───────────────────────────────────────────────────
+// Pings every socket on an interval. This keeps otherwise-idle radio links
+// alive through a reverse proxy, and drops peers that have gone away without a
+// close frame (which the browser clients cannot recover from on their own).
+const heartbeatTimer = setInterval(() => {
+    for (const socket of wss.clients) {
+        if (socket.readyState !== WebSocket.OPEN) {
+            continue;
+        }
+        // No pong since the last sweep — treat the peer as gone.
+        if (socket.isAlive === false) {
+            socket.terminate();
+            continue;
+        }
+        socket.isAlive = false;
+        try {
+            socket.ping();
+        } catch {
+            // Socket died between the readyState check and the ping.
+        }
+    }
+}, WS_HEARTBEAT_SECONDS * 1000);
+
+wss.on("close", () => clearInterval(heartbeatTimer));
 
 server.listen(PORT, () => {
     // eslint-disable-next-line no-console

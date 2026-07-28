@@ -68,6 +68,50 @@ Legacy compatibility:
 
 - `ACCESS_TOKEN` still works if set, but password session login is preferred.
 
+## Behind nginx (reverse proxy)
+
+The radio is almost entirely WebSocket traffic, including the binary PCM relay,
+so a plain `proxy_pass` is not enough — the upgrade headers are required or the
+connection is rejected at the handshake.
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name radio.openbvenews.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+
+        # Required, or the WebSocket upgrade fails
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Voice is real-time; buffering adds audible latency
+        proxy_buffering off;
+
+        # Longer than WS_HEARTBEAT_SECONDS so idle radios are not dropped
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+}
+```
+
+Also set in `.env`:
+
+- `TRUST_PROXY=true` — so `X-Forwarded-For` / `X-Forwarded-Proto` are honoured.
+  Without it every client appears to come from the proxy, which breaks rate
+  limiting and `ALLOWED_IPS`.
+- `ALLOW_ANONYMOUS_WS=true` — if in-game clients connect without logging in.
+
+Clients reach it over `wss://` on 443; nginx terminates TLS and the server itself
+stays plain HTTP on the loopback interface.
+
 ## Run (HTTPS local)
 
 Set these environment variables before starting:
