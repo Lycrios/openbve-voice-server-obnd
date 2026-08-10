@@ -1949,6 +1949,13 @@ function requestPrivateCall(room, client, targetTrainId) {
         fail("Unit " + target.trainId + " is busy.");
         return;
     }
+    // The target has switched private calls off. Refused with the wording the
+    // caller is meant to see, and without ringing them — the whole point of the
+    // setting is that they are not disturbed.
+    if (target.allowCalls === false) {
+        fail("Call Denied");
+        return;
+    }
     if (target.rank === "t1") {
         fail("Unit " + target.trainId + " cannot take private calls.");
         return;
@@ -2024,20 +2031,29 @@ function privateCallPtt(client, pressed) {
     }
 
     if (pressed) {
-        if (!call.holderId || call.holderId === client.id) {
-            call.holderId = client.id;
-            call.grantedAt = Date.now();
-            send(client.ws, {
-                type: "ptt-granted",
-                payload: { channel: "private", reason: "private-call" },
-            });
-            pushCallTxState(call, client.id, true);
-        } else {
-            send(client.ws, {
-                type: "ptt-denied",
-                payload: { channel: "private", reason: "peer-transmitting" },
-            });
+        // A call is two people talking, not a channel to be queued for: either
+        // party may take the line from the other at any time, and neither gets a
+        // courtesy tone for it. Refusing the key here — as this used to — made a
+        // one-to-one conversation harder to hold than an open channel.
+        const previousHolder = call.holderId;
+        if (previousHolder && previousHolder !== client.id) {
+            const peer = clientsById.get(previousHolder);
+            if (peer && peer.ws.readyState === WebSocket.OPEN) {
+                send(peer.ws, {
+                    type: "ptt-revoked",
+                    payload: { channel: "private", reason: "peer-override" },
+                });
+            }
+            pushCallTxState(call, previousHolder, false);
         }
+
+        call.holderId = client.id;
+        call.grantedAt = Date.now();
+        send(client.ws, {
+            type: "ptt-granted",
+            payload: { channel: "private", reason: "private-call" },
+        });
+        pushCallTxState(call, client.id, true);
         return true;
     }
 
@@ -2904,6 +2920,8 @@ wss.on("connection", (ws, req) => {
         transport: "webrtc",
         // Muted off the open channels by a dispatcher; private calls still work.
         muted: false,
+        /// Whether this client accepts incoming private calls. Their own choice.
+        allowCalls: true,
         /// Which dispatcher muted them, for display.
         mutedByName: "",
         /// Set when the socket misses a heartbeat; see the heartbeat sweep.
@@ -3301,6 +3319,17 @@ wss.on("connection", (ws, req) => {
 
         if (type === "emergency-acknowledge") {
             acknowledgeEmergency(room, client);
+            return;
+        }
+
+        // A client switching its own private calls on or off. Their own setting,
+        // so there is no permission check — it only ever restricts themselves.
+        if (type === "set-allow-calls") {
+            client.allowCalls = payload.allow !== false;
+            send(client.ws, {
+                type: "allow-calls",
+                payload: { allow: client.allowCalls },
+            });
             return;
         }
 
