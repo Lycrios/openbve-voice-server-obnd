@@ -2082,6 +2082,9 @@ function broadcastEmergencyState(room) {
                   // the dispatchers' setting governs every client in the room, rather
                   // than each one deciding for itself.
                   toneSeconds: emergencyToneSeconds(room),
+                  // So a client joining mid-emergency does not start an alarm the
+                  // dispatchers have already answered.
+                  acknowledged: Boolean(e.acknowledged),
               }
             : { active: false },
     });
@@ -2104,6 +2107,39 @@ function emergencyToneSeconds(room) {
     if (raw < MIN_EMERGENCY_TONE_SECONDS) return MIN_EMERGENCY_TONE_SECONDS;
     if (raw > MAX_EMERGENCY_TONE_SECONDS) return MAX_EMERGENCY_TONE_SECONDS;
     return Math.round(raw);
+}
+
+/**
+ * Acknowledges the emergency alarm: silences the tone on every client without
+ * standing the emergency down.
+ *
+ * These are two different things and conflating them was the trap here. The
+ * alarm is the noise; the emergency is the reservation of the channel. A
+ * dispatcher who has seen the alarm wants the noise to stop so they can talk to
+ * the train — they do not want the lock-out lifted, which is what clearing the
+ * emergency would do and would let every other train key up over the incident.
+ */
+function acknowledgeEmergency(room, client) {
+    if (!isRadioAdmin(client)) {
+        send(client.ws, {
+            type: "error",
+            payload: { message: "Only dispatchers can acknowledge an emergency." },
+        });
+        return;
+    }
+    if (!room.emergency) return;
+    if (room.emergency.acknowledged) return;
+
+    room.emergency.acknowledged = true;
+    room.emergency.acknowledgedBy = client.name;
+
+    broadcastRoom(room, {
+        type: "emergency-acknowledged",
+        payload: {
+            byName: client.name,
+            operatorId: room.emergency.operatorId,
+        },
+    });
 }
 
 /// Sets the room's alarm duration. Dispatchers only.
@@ -3096,6 +3132,8 @@ wss.on("connection", (ws, req) => {
                               trainId: room.emergency.trainId,
                               channel: room.emergency.channel,
                               since: room.emergency.startedAt,
+                              toneSeconds: emergencyToneSeconds(room),
+                              acknowledged: Boolean(room.emergency.acknowledged),
                           }
                         : { active: false },
                 },
@@ -3258,6 +3296,11 @@ wss.on("connection", (ws, req) => {
 
         if (type === "set-emergency-tone-seconds") {
             setEmergencyToneSeconds(room, client, payload);
+            return;
+        }
+
+        if (type === "emergency-acknowledge") {
+            acknowledgeEmergency(room, client);
             return;
         }
 
