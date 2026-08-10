@@ -2078,8 +2078,55 @@ function broadcastEmergencyState(room) {
                   trainId: e.trainId,
                   channel: e.channel,
                   since: e.startedAt,
+                  // How long clients sound the alarm for. Sent with the emergency so
+                  // the dispatchers' setting governs every client in the room, rather
+                  // than each one deciding for itself.
+                  toneSeconds: emergencyToneSeconds(room),
               }
             : { active: false },
+    });
+}
+
+/**
+ * Seconds the emergency alarm sounds on every client, dispatcher-adjustable.
+ *
+ * The alarm is meant to get attention and then get out of the way — the channel
+ * stays reserved for as long as the emergency is latched regardless, so this
+ * governs the noise, not the lock-out.
+ */
+const DEFAULT_EMERGENCY_TONE_SECONDS = 20;
+const MIN_EMERGENCY_TONE_SECONDS = 5;
+const MAX_EMERGENCY_TONE_SECONDS = 120;
+
+function emergencyToneSeconds(room) {
+    const raw = Number(room && room.emergencyToneSeconds);
+    if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_EMERGENCY_TONE_SECONDS;
+    if (raw < MIN_EMERGENCY_TONE_SECONDS) return MIN_EMERGENCY_TONE_SECONDS;
+    if (raw > MAX_EMERGENCY_TONE_SECONDS) return MAX_EMERGENCY_TONE_SECONDS;
+    return Math.round(raw);
+}
+
+/// Sets the room's alarm duration. Dispatchers only.
+function setEmergencyToneSeconds(room, client, payload) {
+    if (!isRadioAdmin(client)) {
+        send(client.ws, {
+            type: "error",
+            payload: { message: "Only dispatchers can set the alarm duration." },
+        });
+        return;
+    }
+    const seconds = Number(payload.seconds);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+        send(client.ws, {
+            type: "error",
+            payload: { message: "Alarm duration must be a number of seconds." },
+        });
+        return;
+    }
+    room.emergencyToneSeconds = seconds;
+    broadcastRoom(room, {
+        type: "emergency-tone-seconds",
+        payload: { seconds: emergencyToneSeconds(room) },
     });
 }
 
@@ -3039,6 +3086,7 @@ wss.on("connection", (ws, req) => {
                     // Radio authority, which dispatchers hold regardless of rank.
                     // Distinct from isAdmin, which is account-level.
                     isRadioAdmin: isRadioAdmin(client),
+                    emergencyToneSeconds: emergencyToneSeconds(room),
                     // So a client joining mid-emergency is alarmed straight away.
                     emergency: room.emergency
                         ? {
@@ -3205,6 +3253,11 @@ wss.on("connection", (ws, req) => {
 
         if (type === "set-train-id") {
             setClientTrainId(room, client, payload);
+            return;
+        }
+
+        if (type === "set-emergency-tone-seconds") {
+            setEmergencyToneSeconds(room, client, payload);
             return;
         }
 
