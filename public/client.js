@@ -19,6 +19,8 @@ const state = {
   isAdmin: false,
   isMod: false,
   isT1: true,
+  /// Muted off the open channels by a dispatcher. Private calls still work.
+  muted: false,
   currentRoom: null,
   currentRoomName: "",
   currentCreatorId: null,
@@ -631,6 +633,13 @@ function updateSelfStatus() {
 
   if (!state.selfId) {
     setUserStatus("User: joining...");
+    return;
+  }
+
+  // Outranks the states below it: a muted client is never granted TX, and
+  // showing "listening" would hide the reason the PTT does nothing.
+  if (state.muted) {
+    setUserStatus("User: muted");
     return;
   }
 
@@ -2900,6 +2909,8 @@ async function join(roomId, userName) {
       state.rank     = msg.payload.rank || "t1";
       state.isAdmin  = msg.payload.isAdmin || false;
       state.isMod    = msg.payload.isMod   || false;
+      // Mute is per-session, so a reconnect starts clear.
+      state.muted    = Boolean(msg.payload.self.muted);
       state.isT1     = msg.payload.isT1    !== false ? (state.rank === "t1") : false;
       state.currentRoom = msg.payload.roomId;
       state.currentRoomName = msg.payload.roomName || "Radio";
@@ -3118,6 +3129,48 @@ async function join(roomId, userName) {
     if (msg.type === "ptt-granted") {
       setTx(true);
       setChannelState(`TX granted on ${msg.payload.channel}`);
+      return;
+    }
+
+    if (msg.type === "ptt-denied") {
+      setTx(false);
+      cutNoiseNow();
+      setChannelState(
+        msg.payload.reason === "muted"
+          ? "Muted by dispatcher"
+          : msg.payload.reason === "emergency"
+            ? "Emergency in progress"
+            : "TX denied"
+      );
+      return;
+    }
+
+    // A dispatcher has muted or unmuted us on the open channels. Private calls
+    // are unaffected, which is worth saying — otherwise the radio just looks dead.
+    if (msg.type === "mute-state") {
+      state.muted = Boolean(msg.payload.muted);
+      if (state.muted) {
+        setTx(false);
+        cutNoiseNow();
+        setChannelState(
+          msg.payload.byName
+            ? `Muted by ${msg.payload.byName} — calls still work`
+            : "Muted by dispatcher — calls still work"
+        );
+      } else {
+        setChannelState("Unmuted by dispatcher");
+      }
+      updateSelfStatus();
+      return;
+    }
+
+    // A dispatcher has reassigned our TID. Put it in the box so the number the
+    // operator sees is the number that will be called.
+    if (msg.type === "train-id-assigned") {
+      if (trainIdEl) trainIdEl.value = String(msg.payload.trainId || "");
+      updateChannelDisplay();
+      updateMenuDisplay();
+      setChannelState(`TID set to ${msg.payload.trainId} by dispatcher`);
       return;
     }
 

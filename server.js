@@ -140,6 +140,26 @@ function normalizeSessionRole(value) {
     return ALLOWED_SESSION_ROLES.has(v) ? v : "operator";
 }
 
+/**
+ * True for a client that administers the radio.
+ *
+ * Dispatchers run the radio, so signing on for a dispatcher shift carries the
+ * whole radio privilege set: override a transmission in progress, own the
+ * channel list, mute anyone, and reassign TIDs. Staff ranks connect with their
+ * rank as their session role rather than "dispatcher", so they are matched
+ * separately.
+ *
+ * This authority is scoped to the radio and nothing else. It is deliberately
+ * *not* the account's global rank — that governs room administration and the
+ * admin pages, and is only ever granted from the database. Which session roles
+ * a rank may take is still capped by capSessionRole, so a T2 operator cannot
+ * sign on as a dispatcher to get here.
+ */
+function isRadioAdmin(client) {
+    if (!client) return false;
+    return client.role === "dispatcher" || STAFF_RANKS.has(client.rank);
+}
+
 // Audio transport a client is able to negotiate.
 //   "webrtc" — browser clients: peer mesh with other webrtc clients, and can
 //              additionally send/receive PCM over the binary relay.
@@ -289,6 +309,7 @@ const stmts = {
         "INSERT INTO radio_channels (id, label, restricted, position) VALUES (?, ?, ?, ?)",
     ),
     deleteChannel: db.prepare("DELETE FROM radio_channels WHERE id = ?"),
+    renameChannel: db.prepare("UPDATE radio_channels SET label = ? WHERE id = ?"),
     maxChannelPosition: db.prepare(
         "SELECT COALESCE(MAX(position), 0) AS maxPos FROM radio_channels",
     ),
@@ -1300,6 +1321,11 @@ function getClientSummary(member) {
         trainId: member.trainId,
         channel: member.channel,
         transport: member.transport || "webrtc",
+        muted: Boolean(member.muted),
+        // Named so dispatchers see who took a unit off the air, not just that
+        // somebody did.
+        mutedBy: member.muted ? member.mutedByName || "" : "",
+        degraded: Boolean(member.degraded),
     };
 }
 
@@ -1313,6 +1339,9 @@ function getLiveClientSummary(client) {
         trainId: client.trainId,
         channel: client.channel,
         transport: client.transport || "webrtc",
+        muted: Boolean(client.muted),
+        mutedBy: client.muted ? client.mutedByName || "" : "",
+        degraded: Boolean(client.degraded),
     };
 }
 
@@ -1445,7 +1474,11 @@ function releasePTT(room, client, reason = "released") {
             if (
                 !nextClient ||
                 nextClient.roomId !== room.id ||
-                nextClient.channel !== client.channel
+                nextClient.channel !== client.channel ||
+                // Muting clears the queues, so this should not come up — but
+                // handing the channel to a muted client is the one way a mute
+                // could fail silently, so it is checked here as well.
+                nextClient.muted
             ) {
                 continue;
             }
@@ -1486,7 +1519,7 @@ function createChannel(room, client, payload) {
     const fail = (message) =>
         send(client.ws, { type: "error", payload: { message } });
 
-    if (!isDispatcher(client)) {
+    if (!isRadioAdmin(client)) {
         fail("Only dispatchers can create channels.");
         return;
     }
@@ -1532,11 +1565,49 @@ function createChannel(room, client, payload) {
     pushChannelSnapshot(room, id);
 }
 
+/**
+ * Retitles a channel.
+ *
+ * Only the label moves — the id every client's channel assignment is keyed on
+ * stays put, so a rename never strands anyone on a channel that no longer
+ * exists the way a delete-and-recreate would.
+ */
+function renameChannel(room, client, payload) {
+    const fail = (message) =>
+        send(client.ws, { type: "error", payload: { message } });
+
+    if (!isRadioAdmin(client)) {
+        fail("Only dispatchers can rename channels.");
+        return;
+    }
+
+    const id = slugifyChannelId(payload.id);
+    const entry = channelRegistry.get(id);
+    if (!entry) {
+        fail("No such channel.");
+        return;
+    }
+
+    const label = String(payload.label || "").trim().slice(0, 40);
+    if (!label) {
+        fail("A channel needs a name.");
+        return;
+    }
+    if (label === entry.label) {
+        return;
+    }
+
+    stmts.renameChannel.run(label, id);
+    entry.label = label;
+
+    broadcastChannelList(room);
+}
+
 function deleteChannel(room, client, payload) {
     const fail = (message) =>
         send(client.ws, { type: "error", payload: { message } });
 
-    if (!isDispatcher(client)) {
+    if (!isRadioAdmin(client)) {
         fail("Only dispatchers can delete channels.");
         return;
     }
@@ -1578,6 +1649,182 @@ function deleteChannel(room, client, payload) {
     }
 
     broadcastChannelList(room);
+}
+
+// ── Dispatcher control of other clients ───────────────────────────────────
+
+/// Pushes a member's current summary to the whole room, self included.
+function broadcastMemberUpdate(room, targetId) {
+    const member = room.members.get(targetId);
+    if (!member) return;
+    broadcastRoom(room, {
+        type: "peer-updated",
+        payload: getClientSummary(member),
+    });
+}
+
+/**
+ * Mutes standing against a room, so they survive the muted client reconnecting.
+ *
+ * Without this a mute lasts only as long as one WebSocket: an operator who did
+ * not care for being taken off the air could simply rejoin, which would make
+ * the whole thing advisory. Held in memory rather than the database — a mute is
+ * a shift-level action, and a server restart drops every session anyway.
+ */
+function roomMutes(room) {
+    if (!room.mutes) room.mutes = new Map();
+    return room.mutes;
+}
+
+/**
+ * Stable identity for carrying a mute across reconnects.
+ *
+ * Authenticated clients are keyed on the account. In-game clients connect
+ * anonymously and have no account, so they are keyed on their display name —
+ * weaker, since a rename escapes it, but it is the only identity they present.
+ */
+function muteKey(client) {
+    if (!client) return null;
+    if (client.accountId) return "acct:" + client.accountId;
+    const name = String(client.name || "").trim().toLowerCase();
+    return name ? "name:" + name : null;
+}
+
+/// Re-applies a standing mute to a client that has just joined.
+function applyStandingMute(room, client) {
+    const key = muteKey(client);
+    if (!key) return;
+    const standing = roomMutes(room).get(key);
+    if (!standing) return;
+    client.muted = true;
+    client.mutedByName = standing.by;
+}
+
+/**
+ * Mutes or unmutes a client on the open channels.
+ *
+ * Muting takes away the channels only. The muted client still hears everything,
+ * and can still be reached by — and place — private calls, which is how a
+ * dispatcher talks to somebody they have just taken off the air. What it does
+ * take with it is the emergency button: an operator cannot mute-proof themselves
+ * by raising an emergency, so muting stands down one they are holding.
+ *
+ * Dispatchers are mutable too, by any other dispatcher. Muting yourself is not
+ * allowed — nobody else can be relied on to be online to undo it.
+ */
+function setClientMuted(room, client, payload) {
+    const fail = (message) =>
+        send(client.ws, { type: "error", payload: { message } });
+
+    if (!isRadioAdmin(client)) {
+        fail("Only dispatchers can mute.");
+        return;
+    }
+
+    const targetId = String(payload.targetId || "");
+    const target = clientsById.get(targetId);
+    if (!target || target.roomId !== room.id) {
+        fail("That unit is not on this server.");
+        return;
+    }
+    if (target.id === client.id) {
+        fail("You cannot mute yourself.");
+        return;
+    }
+
+    const muted = Boolean(payload.muted);
+    if (target.muted === muted) {
+        return;
+    }
+    target.muted = muted;
+    target.mutedByName = muted ? client.name : "";
+
+    // Stand the mute against the room too, so rejoining does not clear it.
+    const key = muteKey(target);
+    if (key) {
+        if (muted) {
+            roomMutes(room).set(key, { by: client.name, at: Date.now() });
+        } else {
+            roomMutes(room).delete(key);
+        }
+    }
+
+    const member = room.members.get(target.id);
+    if (member) {
+        member.muted = muted;
+        member.mutedByName = target.mutedByName;
+    }
+
+    if (muted) {
+        // Take the line off them now rather than at the end of the transmission
+        // they are part-way through, and drop any place they were holding in a queue.
+        releasePTT(room, target, "muted");
+        removeClientFromQueues(room, target.id);
+        if (room.emergency && room.emergency.operatorId === target.id) {
+            room.emergency = null;
+            broadcastEmergencyState(room);
+        }
+    }
+
+    send(target.ws, {
+        type: "mute-state",
+        payload: { muted, byName: client.name },
+    });
+    broadcastMemberUpdate(room, target.id);
+}
+
+/**
+ * Reassigns another client's TID — the 4-digit number private calls are placed
+ * against, and how operators are identified on the air.
+ *
+ * An assignment made by a dispatcher sticks: it is latched so the client's own
+ * presence updates cannot quietly put the old number back, which would leave the
+ * dispatcher calling a TID nobody answers to.
+ */
+function setClientTrainId(room, client, payload) {
+    const fail = (message) =>
+        send(client.ws, { type: "error", payload: { message } });
+
+    if (!isRadioAdmin(client)) {
+        fail("Only dispatchers can assign TIDs.");
+        return;
+    }
+
+    const targetId = String(payload.targetId || "");
+    const target = clientsById.get(targetId);
+    if (!target || target.roomId !== room.id) {
+        fail("That unit is not on this server.");
+        return;
+    }
+
+    const trainId = String(payload.trainId || "").replace(/[^0-9]/g, "");
+    if (!/^\d{4}$/.test(trainId)) {
+        fail("A TID is four digits.");
+        return;
+    }
+    if (trainId === target.trainId) {
+        return;
+    }
+    for (const member of room.members.values()) {
+        if (member.id !== target.id && member.trainId === trainId) {
+            fail("TID " + trainId + " is already in use.");
+            return;
+        }
+    }
+
+    target.trainId = trainId;
+    target.trainIdLocked = true;
+
+    const member = room.members.get(target.id);
+    if (member) {
+        member.trainId = trainId;
+    }
+
+    send(target.ws, {
+        type: "train-id-assigned",
+        payload: { trainId, byName: client.name },
+    });
+    broadcastMemberUpdate(room, target.id);
 }
 
 // ── Private one-to-one calls ──────────────────────────────────────────────
@@ -1811,16 +2058,12 @@ function privateCallPtt(client, pressed) {
 // reserved for that operator and the dispatchers, and every client is alarmed.
 // Dispatchers are the master of the radio system, so they may also clear it.
 
-function isDispatcher(client) {
-    return Boolean(client) && STAFF_RANKS.has(client.rank);
-}
-
 /// True when this client is allowed to key up during an active emergency.
 function mayTransmitDuringEmergency(room, client) {
     if (!room.emergency) {
         return true;
     }
-    return client.id === room.emergency.operatorId || isDispatcher(client);
+    return client.id === room.emergency.operatorId || isRadioAdmin(client);
 }
 
 function broadcastEmergencyState(room) {
@@ -1889,7 +2132,7 @@ function setEmergency(room, client, active) {
     }
 
     // Only the operator who raised it, or a dispatcher, may stand it down.
-    if (room.emergency.operatorId !== client.id && !isDispatcher(client)) {
+    if (room.emergency.operatorId !== client.id && !isRadioAdmin(client)) {
         send(client.ws, {
             type: "error",
             payload: { message: "Only the raising operator or a dispatcher can clear an emergency." },
@@ -1917,6 +2160,17 @@ function requestPTT(room, client, channelName) {
     client.channel = channelName;
     const channelState = getChannelState(room, channelName);
     if (!channelState) {
+        return;
+    }
+
+    // A dispatcher has muted this client off the open channels. Private calls are
+    // arbitrated before this is ever reached, so a muted operator can still be
+    // spoken to one-to-one — they are off the air, not cut off.
+    if (client.muted) {
+        send(client.ws, {
+            type: "ptt-denied",
+            payload: { channel: channelName, reason: "muted" },
+        });
         return;
     }
 
@@ -1950,12 +2204,19 @@ function requestPTT(room, client, channelName) {
     // The channel is held by somebody else. Once they have blocked the line for
     // longer than the configured limit, take it from them rather than queueing,
     // so one stuck or over-long transmission cannot hold the channel forever.
+    //
+    // A dispatcher does not wait out that window at all. They administer the
+    // radio, and the traffic they need to break into — an operator running long,
+    // or one who needs stopping — is exactly the traffic the window would make
+    // them sit through.
     const heldForMs = channelState.grantedAt
         ? Date.now() - channelState.grantedAt
         : 0;
+    const dispatcherOverride = isRadioAdmin(client);
     if (
-        PTT_INTERRUPT_SECONDS > 0 &&
-        heldForMs >= PTT_INTERRUPT_SECONDS * 1000
+        dispatcherOverride ||
+        (PTT_INTERRUPT_SECONDS > 0 &&
+            heldForMs >= PTT_INTERRUPT_SECONDS * 1000)
     ) {
         const previousHolder = clientsById.get(channelState.holderId);
 
@@ -1968,7 +2229,9 @@ function requestPTT(room, client, channelName) {
                 type: "ptt-revoked",
                 payload: {
                     channel: channelName,
-                    reason: "interrupted",
+                    reason: dispatcherOverride
+                        ? "dispatcher-override"
+                        : "interrupted",
                     heldSeconds: Math.round(heldForMs / 1000),
                 },
             });
@@ -1984,7 +2247,9 @@ function requestPTT(room, client, channelName) {
             type: "ptt-granted",
             payload: {
                 channel: channelName,
-                reason: "interrupted-previous",
+                reason: dispatcherOverride
+                    ? "dispatcher-override"
+                    : "interrupted-previous",
             },
         });
 
@@ -2549,15 +2814,27 @@ wss.on("connection", (ws, req) => {
         role: "operator",
         line: "A",
         trainId: "",
+        // Set once a dispatcher assigns the TID, after which the client's own
+        // presence updates no longer get to change it.
+        trainIdLocked: false,
         channel: DEFAULT_CHANNEL,
         transport: "webrtc",
+        // Muted off the open channels by a dispatcher; private calls still work.
+        muted: false,
+        /// Which dispatcher muted them, for display.
+        mutedByName: "",
+        /// Set when the socket misses a heartbeat; see the heartbeat sweep.
+        degraded: false,
         privateCallId: null,
         wsUrl: req.url,
         wsHeaders: req.headers,
     };
 
-    // Heartbeat: flag lives on the socket so the sweep needs no client lookup.
+    // Heartbeat: flags live on the socket so the sweep needs no client lookup,
+    // and a back-reference so it can publish the degraded state to the room.
     ws.isAlive = true;
+    ws.missedPongs = 0;
+    ws.voiceClient = client;
     ws.on("pong", () => {
         ws.isAlive = true;
     });
@@ -2717,6 +2994,9 @@ wss.on("connection", (ws, req) => {
             );
             client.transport = normalizeTransport(payload.transport);
 
+            // A mute the dispatchers set earlier follows them back in.
+            applyStandingMute(room, client);
+
             // Add to room members
             room.clients.add(client.id);
             room.members.set(client.id, {
@@ -2728,6 +3008,9 @@ wss.on("connection", (ws, req) => {
                 trainId: client.trainId,
                 channel: client.channel,
                 transport: client.transport,
+                muted: client.muted,
+                mutedByName: client.mutedByName,
+                degraded: client.degraded,
             });
             clientsById.set(client.id, client);
 
@@ -2753,6 +3036,9 @@ wss.on("connection", (ws, req) => {
                     isAdmin: rank === "admin",
                     isMod: rank === "mod",
                     isT1: rank === "t1",
+                    // Radio authority, which dispatchers hold regardless of rank.
+                    // Distinct from isAdmin, which is account-level.
+                    isRadioAdmin: isRadioAdmin(client),
                     // So a client joining mid-emergency is alarmed straight away.
                     emergency: room.emergency
                         ? {
@@ -2812,8 +3098,9 @@ wss.on("connection", (ws, req) => {
         }
 
         if (type === "set-presence") {
-            // Train ID must be numeric only
-            if (payload.trainId) {
+            // Train ID must be numeric only. A TID a dispatcher assigned is not
+            // the client's to change back.
+            if (payload.trainId && !client.trainIdLocked) {
                 client.trainId = String(payload.trainId).replace(/[^0-9]/g, "");
             }
 
@@ -2906,6 +3193,21 @@ wss.on("connection", (ws, req) => {
             return;
         }
 
+        if (type === "channel-rename") {
+            renameChannel(room, client, payload);
+            return;
+        }
+
+        if (type === "set-mute") {
+            setClientMuted(room, client, payload);
+            return;
+        }
+
+        if (type === "set-train-id") {
+            setClientTrainId(room, client, payload);
+            return;
+        }
+
         if (type === "private-call-request") {
             requestPrivateCall(room, client, payload.trainId);
             return;
@@ -2931,6 +3233,19 @@ wss.on("connection", (ws, req) => {
                 send(client.ws, {
                     type: "error",
                     payload: { message: "T1 rank cannot raise an emergency." },
+                });
+                return;
+            }
+            // Being muted takes the emergency button with it, so it cannot be
+            // used to key up over the top of the mute. Clearing one is still
+            // allowed — that path is guarded by setEmergency itself.
+            if (client.muted && Boolean(payload.active)) {
+                send(client.ws, {
+                    type: "error",
+                    payload: {
+                        message:
+                            "You are muted and cannot raise an emergency.",
+                    },
                 });
                 return;
             }
@@ -3067,15 +3382,40 @@ wss.on("connection", (ws, req) => {
 // Pings every socket on an interval. This keeps otherwise-idle radio links
 // alive through a reverse proxy, and drops peers that have gone away without a
 // close frame (which the browser clients cannot recover from on their own).
+//
+// One missed pong marks the client degraded rather than dropping it: a train on
+// a marginal connection is exactly the case where cutting the radio is the wrong
+// answer, and it gives dispatchers a visible "reconnecting" state before the
+// unit disappears. Two consecutive misses is a real disconnection.
+
+/// Flags a client degraded (or recovered) and tells the room, if it changed.
+function setClientDegraded(client, degraded) {
+    if (!client || client.degraded === degraded) return;
+    client.degraded = degraded;
+    const room = client.roomId ? rooms.get(client.roomId) : null;
+    if (!room) return;
+    const member = room.members.get(client.id);
+    if (member) member.degraded = degraded;
+    broadcastMemberUpdate(room, client.id);
+}
+
 const heartbeatTimer = setInterval(() => {
     for (const socket of wss.clients) {
         if (socket.readyState !== WebSocket.OPEN) {
             continue;
         }
-        // No pong since the last sweep — treat the peer as gone.
+        const client = socket.voiceClient;
         if (socket.isAlive === false) {
-            socket.terminate();
-            continue;
+            // Missed a second sweep in a row — the peer really is gone.
+            if (socket.missedPongs >= 2) {
+                socket.terminate();
+                continue;
+            }
+            socket.missedPongs = (socket.missedPongs || 0) + 1;
+            setClientDegraded(client, true);
+        } else {
+            socket.missedPongs = 0;
+            setClientDegraded(client, false);
         }
         socket.isAlive = false;
         try {
