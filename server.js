@@ -1409,6 +1409,96 @@ function removeClientFromQueues(room, clientId) {
     }
 }
 
+/**
+ * Takes a client out of a room and tells the room about it.
+ *
+ * Shared by the socket-close handler and the duplicate-session eviction on
+ * join. The eviction needs this to run *synchronously*: waiting for the old
+ * socket's close event means the replacing client's `joined` payload still
+ * lists the session it just replaced, which is what put a second copy of a
+ * dispatcher on the roster after they cycled their radio power.
+ */
+function removeClientFromRoom(room, client) {
+    if (!room || !client) return;
+    if (!room.clients.has(client.id)) return;
+
+    releasePTT(room, client, "disconnect");
+    removeClientFromQueues(room, client.id);
+
+    room.clients.delete(client.id);
+    room.members.delete(client.id);
+    clientsById.delete(client.id);
+
+    // Only clear the account index if this is still the registered session —
+    // a newer session for the same account will have overwritten it already.
+    if (client.accountId && clientsByAccountId.get(client.accountId) === client) {
+        clientsByAccountId.delete(client.accountId);
+    }
+
+    broadcastRoom(room, { type: "peer-left", payload: { id: client.id } });
+
+    // A private call cannot outlive either party.
+    clearPrivateCallFor(client, "peer-disconnected");
+
+    // An emergency dies with the operator who raised it, otherwise the room
+    // would stay locked down with nobody able to stand it down.
+    if (room.emergency && room.emergency.operatorId === client.id) {
+        room.emergency = null;
+        broadcastEmergencyState(room);
+    }
+
+    for (const channelName of channelIds()) {
+        pushChannelSnapshot(room, channelName);
+    }
+
+    if (room.clients.size === 0) {
+        for (const channelState of room.channels.values()) {
+            channelState.holderId = null;
+            channelState.grantedAt = 0;
+            channelState.queue = [];
+        }
+    }
+}
+
+/** How a client is identified across reconnects: account when known, else name. */
+function sessionIdentity(client) {
+    if (!client) return null;
+    if (client.accountId) return `acct:${client.accountId}`;
+    const name = String(client.name || "").trim().toLowerCase();
+    return name ? `name:${name}` : null;
+}
+
+/**
+ * Drops any earlier session in this room belonging to the same person.
+ *
+ * A radio that is switched off and on again opens a new socket, and the old
+ * one's close frame is not necessarily processed first — so without this the
+ * room briefly holds two sessions for one operator and the newcomer is handed a
+ * peer list containing itself. Matching on account covers signed-in dispatchers;
+ * everyone else is matched on name, which is all the server is given.
+ *
+ * The evicted socket is closed without a `kicked` notice on purpose: this is
+ * almost always the same client reconnecting, and their board reacts to
+ * `kicked` by tearing down whatever connection it currently holds — which by
+ * then is the new one.
+ */
+function evictDuplicateSessions(room, client) {
+    const identity = sessionIdentity(client);
+    if (!identity) return;
+    for (const otherId of [...room.clients]) {
+        if (otherId === client.id) continue;
+        const other = clientsById.get(otherId);
+        if (!other || sessionIdentity(other) !== identity) continue;
+        console.log(`[room] Replacing stale session for '${other.name}' (${other.id})`);
+        removeClientFromRoom(room, other);
+        try {
+            other.ws.close(4000, "superseded");
+        } catch {
+            /* already gone */
+        }
+    }
+}
+
 function getChannelState(room, channelName) {
     return room.channels.get(channelName);
 }
@@ -3044,16 +3134,12 @@ wss.on("connection", (ws, req) => {
             }
             client.accountId = accountId;
 
-            // Kick any existing session for this account (only applies to authenticated users)
+            // One live session per person. Covers signed-in dispatchers by
+            // account and everyone else by name, and runs before this client is
+            // added to the room so the peer list it receives cannot contain the
+            // session it just replaced.
+            evictDuplicateSessions(room, client);
             if (accountId) {
-                const existing = clientsByAccountId.get(accountId);
-                if (existing && existing.id !== client.id) {
-                    send(existing.ws, {
-                        type: "kicked",
-                        payload: { reason: "Signed in from another location" },
-                    });
-                    existing.ws.close(1000, "Duplicate session");
-                }
                 clientsByAccountId.set(accountId, client);
             }
 
@@ -3459,47 +3545,9 @@ wss.on("connection", (ws, req) => {
             return;
         }
 
-        releasePTT(room, client, "disconnect");
-        removeClientFromQueues(room, client.id);
-
-        room.clients.delete(client.id);
-        room.members.delete(client.id);
-        clientsById.delete(client.id);
-
-        // Remove from account index only if this is still the registered session
-        if (
-            client.accountId &&
-            clientsByAccountId.get(client.accountId) === client
-        ) {
-            clientsByAccountId.delete(client.accountId);
-        }
-
-        broadcastRoom(room, {
-            type: "peer-left",
-            payload: { id: client.id },
-        });
-
-        // A private call cannot outlive either party.
-        clearPrivateCallFor(client, "peer-disconnected");
-
-        // An emergency dies with the operator who raised it, otherwise the room
-        // would stay locked down with nobody able to stand it down.
-        if (room.emergency && room.emergency.operatorId === client.id) {
-            room.emergency = null;
-            broadcastEmergencyState(room);
-        }
-
-        for (const channelName of channelIds()) {
-            pushChannelSnapshot(room, channelName);
-        }
-
-        if (room.clients.size === 0) {
-            for (const channelState of room.channels.values()) {
-                channelState.holderId = null;
-                channelState.grantedAt = 0;
-                channelState.queue = [];
-            }
-        }
+        // Safe to call for a session already evicted by a newer one: it returns
+        // immediately when the client is no longer a member of the room.
+        removeClientFromRoom(room, client);
     });
 });
 
