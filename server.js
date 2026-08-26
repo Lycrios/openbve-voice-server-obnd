@@ -1890,6 +1890,51 @@ function pruneStandingMute(room, client) {
     }
 }
 
+/**
+ * TIDs a dispatcher assigned, held against the room so they survive the
+ * assigned client reconnecting.
+ *
+ * The per-client lock alone is not enough: the in-game radio applies its own
+ * TID edit by reconnecting, which builds a fresh client record with the lock
+ * cleared. Without this, an operator could overwrite a dispatcher's assignment
+ * simply by typing a different number into their own radio.
+ *
+ * Keyed like mutes, and in memory for the same reason -- an assignment is a
+ * shift-level action and a restart drops every session anyway.
+ */
+function roomTrainIds(room) {
+    if (!room.assignedTrainIds) room.assignedTrainIds = new Map();
+    return room.assignedTrainIds;
+}
+
+/// Records a dispatcher's assignment so a reconnect cannot shed it.
+function rememberAssignedTrainId(room, client, trainId) {
+    const key = muteKey(client);
+    if (!key) return;
+    roomTrainIds(room).set(key, String(trainId));
+}
+
+/// Re-applies a standing TID assignment to a client that has just joined.
+function applyAssignedTrainId(room, client) {
+    const key = muteKey(client);
+    if (!key) return;
+    const assigned = roomTrainIds(room).get(key);
+    if (!assigned) return;
+
+    // While they were away the number may have been handed to somebody else.
+    // Two units answering to one TID would misdirect every private call placed
+    // against it, so the assignment is dropped rather than duplicated.
+    for (const member of room.members.values()) {
+        if (member.id !== client.id && member.trainId === assigned) {
+            roomTrainIds(room).delete(key);
+            return;
+        }
+    }
+
+    client.trainId = assigned;
+    client.trainIdLocked = true;
+}
+
 function applyStandingMute(room, client) {
     const record = standingMuteFor(room, client, false);
     client.mutedChannels = new Set();
@@ -2077,6 +2122,7 @@ function setClientTrainId(room, client, payload) {
 
     target.trainId = trainId;
     target.trainIdLocked = true;
+    rememberAssignedTrainId(room, target, trainId);
 
     const member = room.members.get(target.id);
     if (member) {
@@ -3493,6 +3539,9 @@ wss.on("connection", (ws, req) => {
 
             // A mute the dispatchers set earlier follows them back in.
             applyStandingMute(room, client);
+            // As does a TID they assigned -- applied after the join payload has
+            // been read, so a reconnect cannot be used to shed it.
+            applyAssignedTrainId(room, client);
 
             // Add to room members
             room.clients.add(client.id);
