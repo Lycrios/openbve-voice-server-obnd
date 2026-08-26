@@ -3341,6 +3341,8 @@ wss.on("connection", (ws, req) => {
         trainIdLocked: false,
         channel: DEFAULT_CHANNEL,
         transport: "webrtc",
+        // Set on join for connections from the dispatcher board.
+        isBoardClient: false,
         // Muted off the open channels by a dispatcher; private calls still work.
         // Global covers every main channel; mutedChannels covers individual ones.
         globalMuted: false,
@@ -3513,11 +3515,37 @@ wss.on("connection", (ws, req) => {
                 // Anonymous game client — grant operator rank so PTT works out of the box
                 rank = "t2";
             }
+            // The dispatcher board is a dispatcher console — there is nothing
+            // else to be on it. A signed-in board session therefore always holds
+            // the dispatcher role, rather than being capped down to whatever rank
+            // happens to be on the room roster.
+            //
+            // Without this a dispatcher whose account had no saved role for the
+            // room resolved to t1 above, which is listener-only: the board came
+            // up unable to transmit, clear an emergency or place a call, and said
+            // nothing about why. Signing in left you with less than an anonymous
+            // game client, which gets t2.
+            //
+            // The lift is for this session only. It is applied after the roster
+            // write above, so it never promotes the underlying account.
+            // Anonymous board sessions are not refused here: a connection with
+            // no account only gets this far on a server that has deliberately
+            // enabled ALLOW_ANONYMOUS_WS, and the check above has already turned
+            // away accountless clients everywhere else. Refusing again would
+            // break local development for no gain in protection.
+            const isBoardClient = String(payload.client || "") === "board";
+            if (isBoardClient && !STAFF_RANKS.has(rank) && rank !== "t3") {
+                rank = "t3";
+            }
+
             client.rank = rank;
+            client.isBoardClient = isBoardClient;
 
             // Staff always connect at their rank as session role; others pick a session role
             if (STAFF_RANKS.has(rank)) {
                 client.role = rank; // "admin" or "mod" as session role for display
+            } else if (isBoardClient) {
+                client.role = "dispatcher";
             } else {
                 const requestedSessionRole = normalizeSessionRole(payload.role);
                 client.role = capSessionRole(requestedSessionRole, rank);
@@ -3660,6 +3688,13 @@ wss.on("connection", (ws, req) => {
             if (STAFF_RANKS.has(client.rank)) {
                 if (client.role !== client.rank) {
                     client.role = client.rank;
+                    roleChanged = true;
+                }
+            } else if (client.isBoardClient) {
+                // A board session stays a dispatcher session; a presence update
+                // must not quietly demote the console mid-shift.
+                if (client.role !== "dispatcher") {
+                    client.role = "dispatcher";
                     roleChanged = true;
                 }
             } else {
