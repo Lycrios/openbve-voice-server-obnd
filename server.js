@@ -3757,11 +3757,14 @@ wss.on("connection", (ws, req) => {
             //
             // Every keyed channel is let go, not just the one being left. A
             // dispatcher broadcasting holds several at once, and releasePTT only
-            // ever addresses client.channel -- so moving channel mid-broadcast
-            // used to leave the rest held. Their next key resets txChannels, and
-            // with the broadcast since disarmed nothing would have released them
-            // at all: those channels stayed locked until the dispatcher dropped
-            // off the server.
+            // ever addresses client.channel, so moving channel mid-broadcast left
+            // the rest keyed by them -- verified against the previous code, which
+            // released only the channel being left.
+            //
+            // A held channel does block other operators: theirs queues behind it.
+            // How long the stale hold survives was not pinned down; it did clear
+            // by itself in every sequence tried. Releasing all of them here makes
+            // that moot rather than relying on whatever cleared it.
             const keyedBefore = [...(client.txChannels || [])];
             client.txChannels = new Set();
             if (keyedBefore.length === 0) {
