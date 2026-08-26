@@ -310,6 +310,9 @@ const stmts = {
     ),
     deleteChannel: db.prepare("DELETE FROM radio_channels WHERE id = ?"),
     renameChannel: db.prepare("UPDATE radio_channels SET label = ? WHERE id = ?"),
+    setChannelRestricted: db.prepare(
+        "UPDATE radio_channels SET restricted = ? WHERE id = ?",
+    ),
     maxChannelPosition: db.prepare(
         "SELECT COALESCE(MAX(position), 0) AS maxPos FROM radio_channels",
     ),
@@ -1321,7 +1324,12 @@ function getClientSummary(member) {
         trainId: member.trainId,
         channel: member.channel,
         transport: member.transport || "webrtc",
+        // `muted` is the effective state on the channel they are standing on, so
+        // the roster shows what actually applies there. The two scopes are sent
+        // alongside it for the dispatcher's mute menu.
         muted: Boolean(member.muted),
+        mutedGlobally: Boolean(member.mutedGlobally),
+        mutedChannels: member.mutedChannels || [],
         // Named so dispatchers see who took a unit off the air, not just that
         // somebody did.
         mutedBy: member.muted ? member.mutedByName || "" : "",
@@ -1339,8 +1347,10 @@ function getLiveClientSummary(client) {
         trainId: client.trainId,
         channel: client.channel,
         transport: client.transport || "webrtc",
-        muted: Boolean(client.muted),
-        mutedBy: client.muted ? client.mutedByName || "" : "",
+        muted: isMutedHere(client),
+        mutedGlobally: Boolean(client.globalMuted),
+        mutedChannels: [...(client.mutedChannels || [])],
+        mutedBy: isMutedHere(client) ? client.mutedByName || "" : "",
         degraded: Boolean(client.degraded),
     };
 }
@@ -1422,6 +1432,12 @@ function removeClientFromRoom(room, client) {
     if (!room || !client) return;
     if (!room.clients.has(client.id)) return;
 
+    // A dispatcher may have been keying several channels at once; every one of
+    // them has to be let go, not just the one they were standing on.
+    for (const ch of client.txChannels || []) {
+        releaseChannelFor(room, client, ch, "disconnect");
+    }
+    client.txChannels = new Set();
     releasePTT(room, client, "disconnect");
     removeClientFromQueues(room, client.id);
 
@@ -1540,7 +1556,18 @@ function pushTxState(room, speakerId, channelName, active) {
 }
 
 function releasePTT(room, client, reason = "released") {
-    const channelState = getChannelState(room, client.channel);
+    return releaseChannelFor(room, client, client.channel, reason);
+}
+
+/**
+ * Releases one named channel for this client.
+ *
+ * Split out from releasePTT so a multi-channel broadcast can let go of each
+ * channel it took: releasing only the one the dispatcher is standing on would
+ * leave the rest keyed open with nobody talking on them.
+ */
+function releaseChannelFor(room, client, channelName, reason = "released") {
+    const channelState = getChannelState(room, channelName);
     if (!channelState) {
         return;
     }
@@ -1553,10 +1580,10 @@ function releasePTT(room, client, reason = "released") {
 
         send(client.ws, {
             type: "ptt-released",
-            payload: { reason },
+            payload: { reason, channel: channelName },
         });
 
-        pushTxState(room, client.id, client.channel, false);
+        pushTxState(room, client.id, channelName, false);
 
         while (channelState.queue.length > 0) {
             const nextId = channelState.queue.shift();
@@ -1564,11 +1591,11 @@ function releasePTT(room, client, reason = "released") {
             if (
                 !nextClient ||
                 nextClient.roomId !== room.id ||
-                nextClient.channel !== client.channel ||
+                nextClient.channel !== channelName ||
                 // Muting clears the queues, so this should not come up — but
                 // handing the channel to a muted client is the one way a mute
                 // could fail silently, so it is checked here as well.
-                nextClient.muted
+                isMutedOn(nextClient, channelName)
             ) {
                 continue;
             }
@@ -1578,17 +1605,17 @@ function releasePTT(room, client, reason = "released") {
             send(nextClient.ws, {
                 type: "ptt-granted",
                 payload: {
-                    channel: client.channel,
+                    channel: channelName,
                     reason: "queue-advanced",
                 },
             });
 
-            pushTxState(room, nextClient.id, client.channel, true);
+            pushTxState(room, nextClient.id, channelName, true);
             break;
         }
     }
 
-    pushChannelSnapshot(room, client.channel);
+    pushChannelSnapshot(room, channelName);
 }
 
 // ── Dispatcher channel management ─────────────────────────────────────────
@@ -1693,6 +1720,62 @@ function renameChannel(room, client, payload) {
     broadcastChannelList(room);
 }
 
+/**
+ * Opens a channel to everyone, or restricts it to T3 and above.
+ *
+ * Access is by rank rather than by naming individuals: a channel is a place, and
+ * who may stand in it is a property of the place. Anyone already standing on a
+ * channel that has just been restricted is moved back to the default one rather
+ * than left somewhere they can no longer reach.
+ */
+function setChannelRestricted(room, client, payload) {
+    const fail = (message) =>
+        send(client.ws, { type: "error", payload: { message } });
+
+    if (!isRadioAdmin(client)) {
+        fail("Only dispatchers can change channel access.");
+        return;
+    }
+
+    const id = slugifyChannelId(payload.id);
+    const entry = channelRegistry.get(id);
+    if (!entry) {
+        fail("No such channel.");
+        return;
+    }
+    if (id === DEFAULT_CHANNEL) {
+        fail("The default channel cannot be restricted.");
+        return;
+    }
+
+    const restricted = Boolean(payload.restricted);
+    if (entry.restricted === restricted) return;
+
+    stmts.setChannelRestricted.run(restricted ? 1 : 0, id);
+    entry.restricted = restricted;
+
+    if (restricted) {
+        for (const r of rooms.values()) {
+            for (const memberId of [...r.clients]) {
+                const member = clientsById.get(memberId);
+                if (!member || member.channel !== id) continue;
+                if (canAccessChannel(member.rank, id)) continue;
+                releaseChannelFor(r, member, id, "channel-restricted");
+                member.channel = DEFAULT_CHANNEL;
+                const record = r.members.get(memberId);
+                if (record) record.channel = DEFAULT_CHANNEL;
+                send(member.ws, {
+                    type: "channel-changed",
+                    payload: { id: memberId, channel: DEFAULT_CHANNEL },
+                });
+                broadcastMemberUpdate(r, memberId);
+            }
+        }
+    }
+
+    broadcastChannelList(room);
+}
+
 function deleteChannel(room, client, payload) {
     const fail = (message) =>
         send(client.ws, { type: "error", payload: { message } });
@@ -1781,13 +1864,62 @@ function muteKey(client) {
 }
 
 /// Re-applies a standing mute to a client that has just joined.
-function applyStandingMute(room, client) {
+/**
+ * The standing record for one identity: a global mute, plus any channels they
+ * are muted on individually.
+ */
+function standingMuteFor(room, client, create) {
+    const key = muteKey(client);
+    if (!key) return null;
+    const mutes = roomMutes(room);
+    let record = mutes.get(key);
+    if (!record && create) {
+        record = { global: false, globalBy: "", channels: new Map() };
+        mutes.set(key, record);
+    }
+    return record || null;
+}
+
+/// Drops a record that no longer mutes anything, so the map does not grow forever.
+function pruneStandingMute(room, client) {
     const key = muteKey(client);
     if (!key) return;
-    const standing = roomMutes(room).get(key);
-    if (!standing) return;
-    client.muted = true;
-    client.mutedByName = standing.by;
+    const record = roomMutes(room).get(key);
+    if (record && !record.global && record.channels.size === 0) {
+        roomMutes(room).delete(key);
+    }
+}
+
+function applyStandingMute(room, client) {
+    const record = standingMuteFor(room, client, false);
+    client.mutedChannels = new Set();
+    client.globalMuted = false;
+    client.mutedByName = "";
+    if (!record) return;
+    client.globalMuted = Boolean(record.global);
+    if (record.global) client.mutedByName = record.globalBy || "";
+    for (const [channel, by] of record.channels) {
+        client.mutedChannels.add(channel);
+        if (!client.mutedByName) client.mutedByName = by || "";
+    }
+}
+
+/**
+ * True when this client is muted on the given channel.
+ *
+ * A global mute covers every main channel; a local one covers only the channel
+ * it was issued on. Neither touches private calls — those are arbitrated
+ * separately and stay open whatever the mute state.
+ */
+function isMutedOn(client, channel) {
+    if (!client) return false;
+    if (client.globalMuted) return true;
+    return Boolean(client.mutedChannels && client.mutedChannels.has(channel));
+}
+
+/// Whether the client is muted where they are currently standing. For display.
+function isMutedHere(client) {
+    return isMutedOn(client, client && client.channel);
 }
 
 /**
@@ -1823,29 +1955,63 @@ function setClientMuted(room, client, payload) {
     }
 
     const muted = Boolean(payload.muted);
-    if (target.muted === muted) {
+    // "global" silences every main channel; "channel" silences one. Defaults to
+    // the channel the target is standing on, which is the one the dispatcher was
+    // looking at when they right-clicked.
+    const global = payload.scope === "global";
+    const channel = global
+        ? null
+        : String(payload.channel || target.channel || DEFAULT_CHANNEL);
+
+    if (!global && !channelExists(channel)) {
+        fail("No such channel.");
         return;
     }
-    target.muted = muted;
-    target.mutedByName = muted ? client.name : "";
 
-    // Stand the mute against the room too, so rejoining does not clear it.
-    const key = muteKey(target);
-    if (key) {
+    const before = isMutedHere(target);
+    const record = standingMuteFor(room, target, muted);
+
+    if (global) {
+        if (target.globalMuted === muted) return;
+        target.globalMuted = muted;
+        if (record) {
+            record.global = muted;
+            record.globalBy = muted ? client.name : "";
+        }
+    } else {
+        const already = target.mutedChannels && target.mutedChannels.has(channel);
+        if (Boolean(already) === muted) return;
+        if (!target.mutedChannels) target.mutedChannels = new Set();
         if (muted) {
-            roomMutes(room).set(key, { by: client.name, at: Date.now() });
+            target.mutedChannels.add(channel);
+            if (record) record.channels.set(channel, client.name);
         } else {
-            roomMutes(room).delete(key);
+            target.mutedChannels.delete(channel);
+            if (record) record.channels.delete(channel);
+        }
+    }
+
+    if (muted) {
+        target.mutedByName = client.name;
+    } else {
+        pruneStandingMute(room, target);
+        // Re-derive from what is left, so lifting one scope does not clear the
+        // attribution of another that still stands.
+        if (!isMutedOn(target, target.channel) && !target.globalMuted) {
+            target.mutedByName = "";
         }
     }
 
     const member = room.members.get(target.id);
     if (member) {
-        member.muted = muted;
+        member.muted = isMutedHere(target);
+        member.mutedGlobally = Boolean(target.globalMuted);
+        member.mutedChannels = [...(target.mutedChannels || [])];
         member.mutedByName = target.mutedByName;
     }
 
-    if (muted) {
+    // Only act on the line if the mute actually bites where they are standing.
+    if (!before && isMutedHere(target)) {
         // Take the line off them now rather than at the end of the transmission
         // they are part-way through, and drop any place they were holding in a queue.
         releasePTT(room, target, "muted");
@@ -1858,7 +2024,14 @@ function setClientMuted(room, client, payload) {
 
     send(target.ws, {
         type: "mute-state",
-        payload: { muted, byName: client.name },
+        payload: {
+            muted: isMutedHere(target),
+            scope: global ? "global" : "channel",
+            channel: global ? null : channel,
+            mutedGlobally: Boolean(target.globalMuted),
+            mutedChannels: [...(target.mutedChannels || [])],
+            byName: muted ? client.name : "",
+        },
     });
     broadcastMemberUpdate(room, target.id);
 }
@@ -2248,6 +2421,108 @@ function acknowledgeEmergency(room, client) {
     });
 }
 
+/**
+ * Seconds a transmission must run before another operator's PTT takes the line
+ * from them, dispatcher-adjustable per room.
+ *
+ * This is the lever for an open mic or somebody hogging the channel: it is a
+ * floor on interruption, not a transmission limit — nobody is ever cut off
+ * unless another operator actually wants to speak.
+ */
+const MIN_INTERRUPT_SECONDS = 20;
+const MAX_INTERRUPT_SECONDS = 200;
+
+function interruptSeconds(room) {
+    const raw = Number(room && room.interruptSeconds);
+    if (!Number.isFinite(raw) || raw <= 0) {
+        // Not set for this room yet: fall back to the deployment default, which
+        // may legitimately be 0 to disable interruption altogether.
+        return PTT_INTERRUPT_SECONDS;
+    }
+    if (raw < MIN_INTERRUPT_SECONDS) return MIN_INTERRUPT_SECONDS;
+    if (raw > MAX_INTERRUPT_SECONDS) return MAX_INTERRUPT_SECONDS;
+    return Math.round(raw);
+}
+
+/**
+ * Every channel a client's transmission should go out on.
+ *
+ * Ordinarily just the one they are standing on. A dispatcher may add others, or
+ * arm "transmit all" — the point being a single announcement that reaches every
+ * channel at once instead of repeating it five times. Private calls are not
+ * channels and are never included.
+ */
+function transmitChannelsFor(client) {
+    const channels = new Set();
+    if (client.channel) channels.add(client.channel);
+    if (!isRadioAdmin(client)) return channels;
+
+    if (client.transmitAll) {
+        for (const id of channelIds()) channels.add(id);
+        return channels;
+    }
+    for (const id of client.multiChannels || []) {
+        if (channelExists(id)) channels.add(id);
+    }
+    return channels;
+}
+
+/// Sets which extra channels a dispatcher keys alongside their own.
+function setTransmitChannels(room, client, payload) {
+    if (!isRadioAdmin(client)) {
+        send(client.ws, {
+            type: "error",
+            payload: { message: "Only dispatchers can transmit to several channels." },
+        });
+        return;
+    }
+
+    client.transmitAll = Boolean(payload.all);
+    const next = new Set();
+    if (Array.isArray(payload.channels)) {
+        for (const raw of payload.channels) {
+            const id = slugifyChannelId(raw);
+            // The channel they are standing on is always keyed; listing it as an
+            // extra would double up.
+            if (channelExists(id) && id !== client.channel) next.add(id);
+        }
+    }
+    client.multiChannels = next;
+
+    send(client.ws, {
+        type: "transmit-channels",
+        payload: {
+            all: client.transmitAll,
+            channels: [...next],
+            effective: [...transmitChannelsFor(client)],
+        },
+    });
+}
+
+/// Sets the room's interruption window. Dispatchers only.
+function setInterruptSeconds(room, client, payload) {
+    if (!isRadioAdmin(client)) {
+        send(client.ws, {
+            type: "error",
+            payload: { message: "Only dispatchers can set the override timer." },
+        });
+        return;
+    }
+    const seconds = Number(payload.seconds);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+        send(client.ws, {
+            type: "error",
+            payload: { message: "Override timer must be a number of seconds." },
+        });
+        return;
+    }
+    room.interruptSeconds = seconds;
+    broadcastRoom(room, {
+        type: "interrupt-seconds",
+        payload: { seconds: interruptSeconds(room) },
+    });
+}
+
 /// Sets the room's alarm duration. Dispatchers only.
 function setEmergencyToneSeconds(room, client, payload) {
     if (!isRadioAdmin(client)) {
@@ -2337,7 +2612,15 @@ function setEmergency(room, client, active) {
     broadcastEmergencyState(room);
 }
 
-function requestPTT(room, client, channelName) {
+/**
+ * Keys one channel for this client.
+ *
+ * `secondary` marks a channel being keyed as part of a multi-channel broadcast:
+ * the client is not moved onto it and does not get a second ptt-granted for it,
+ * because they are still standing on their own channel and already know they
+ * are transmitting.
+ */
+function requestPTT(room, client, channelName, secondary = false) {
     if (!channelExists(channelName)) {
         send(client.ws, {
             type: "error",
@@ -2346,7 +2629,7 @@ function requestPTT(room, client, channelName) {
         return;
     }
 
-    client.channel = channelName;
+    if (!secondary) client.channel = channelName;
     const channelState = getChannelState(room, channelName);
     if (!channelState) {
         return;
@@ -2355,7 +2638,7 @@ function requestPTT(room, client, channelName) {
     // A dispatcher has muted this client off the open channels. Private calls are
     // arbitrated before this is ever reached, so a muted operator can still be
     // spoken to one-to-one — they are off the air, not cut off.
-    if (client.muted) {
+    if (isMutedOn(client, channelName)) {
         send(client.ws, {
             type: "ptt-denied",
             payload: { channel: channelName, reason: "muted" },
@@ -2377,13 +2660,15 @@ function requestPTT(room, client, channelName) {
         channelState.holderId = client.id;
         channelState.grantedAt = Date.now();
 
-        send(client.ws, {
-            type: "ptt-granted",
-            payload: {
-                channel: channelName,
-                reason: "free-channel",
-            },
-        });
+        if (!secondary) {
+            send(client.ws, {
+                type: "ptt-granted",
+                payload: {
+                    channel: channelName,
+                    reason: "free-channel",
+                },
+            });
+        }
 
         pushTxState(room, client.id, channelName, true);
         pushChannelSnapshot(room, channelName);
@@ -2402,10 +2687,10 @@ function requestPTT(room, client, channelName) {
         ? Date.now() - channelState.grantedAt
         : 0;
     const dispatcherOverride = isRadioAdmin(client);
+    const windowSeconds = interruptSeconds(room);
     if (
         dispatcherOverride ||
-        (PTT_INTERRUPT_SECONDS > 0 &&
-            heldForMs >= PTT_INTERRUPT_SECONDS * 1000)
+        (windowSeconds > 0 && heldForMs >= windowSeconds * 1000)
     ) {
         const previousHolder = clientsById.get(channelState.holderId);
 
@@ -2432,15 +2717,17 @@ function requestPTT(room, client, channelName) {
         channelState.holderId = client.id;
         channelState.grantedAt = Date.now();
 
-        send(client.ws, {
-            type: "ptt-granted",
-            payload: {
-                channel: channelName,
-                reason: dispatcherOverride
-                    ? "dispatcher-override"
-                    : "interrupted-previous",
-            },
-        });
+        if (!secondary) {
+            send(client.ws, {
+                type: "ptt-granted",
+                payload: {
+                    channel: channelName,
+                    reason: dispatcherOverride
+                        ? "dispatcher-override"
+                        : "interrupted-previous",
+                },
+            });
+        }
 
         pushTxState(room, client.id, channelName, true);
         pushChannelSnapshot(room, channelName);
@@ -3009,9 +3296,18 @@ wss.on("connection", (ws, req) => {
         channel: DEFAULT_CHANNEL,
         transport: "webrtc",
         // Muted off the open channels by a dispatcher; private calls still work.
-        muted: false,
+        // Global covers every main channel; mutedChannels covers individual ones.
+        globalMuted: false,
+        mutedChannels: new Set(),
         /// Whether this client accepts incoming private calls. Their own choice.
         allowCalls: true,
+        // ── Multi-channel transmit (dispatchers) ──────────────────
+        /// Extra channels this dispatcher keys alongside the one they stand on.
+        multiChannels: new Set(),
+        /// True while "transmit to all" is armed.
+        transmitAll: false,
+        /// Channels currently keyed. Empty unless transmitting.
+        txChannels: new Set(),
         /// Which dispatcher muted them, for display.
         mutedByName: "",
         /// Set when the socket misses a heartbeat; see the heartbeat sweep.
@@ -3049,15 +3345,29 @@ wss.on("connection", (ws, req) => {
             if (client.roomId) {
                 const room = rooms.get(client.roomId);
                 if (room) {
-                    const chState = getChannelState(room, client.channel);
-                    if (chState && chState.holderId === client.id) {
+                    // Fan out across every channel this client currently holds. A
+                    // dispatcher transmitting to all channels holds several at once,
+                    // and each listener should hear it exactly once wherever they are.
+                    const keyed = [];
+                    for (const ch of client.txChannels || []) {
+                        const st = getChannelState(room, ch);
+                        if (st && st.holderId === client.id) keyed.push(ch);
+                    }
+                    if (keyed.length === 0) {
+                        const fallback = getChannelState(room, client.channel);
+                        if (fallback && fallback.holderId === client.id) {
+                            keyed.push(client.channel);
+                        }
+                    }
+                    if (keyed.length > 0) {
+                        const audience = new Set(keyed);
                         const senderRelayOnly = client.transport === "relay";
                         for (const lid of room.clients) {
                             if (lid === client.id) continue;
                             const listener = clientsById.get(lid);
                             if (
                                 !listener ||
-                                listener.channel !== client.channel ||
+                                !audience.has(listener.channel) ||
                                 listener.ws.readyState !== WebSocket.OPEN
                             ) {
                                 continue;
@@ -3195,7 +3505,9 @@ wss.on("connection", (ws, req) => {
                 trainId: client.trainId,
                 channel: client.channel,
                 transport: client.transport,
-                muted: client.muted,
+                muted: isMutedHere(client),
+                mutedGlobally: Boolean(client.globalMuted),
+                mutedChannels: [...(client.mutedChannels || [])],
                 mutedByName: client.mutedByName,
                 degraded: client.degraded,
             });
@@ -3227,6 +3539,7 @@ wss.on("connection", (ws, req) => {
                     // Distinct from isAdmin, which is account-level.
                     isRadioAdmin: isRadioAdmin(client),
                     emergencyToneSeconds: emergencyToneSeconds(room),
+                    interruptSeconds: interruptSeconds(room),
                     // So a client joining mid-emergency is alarmed straight away.
                     emergency: room.emergency
                         ? {
@@ -3347,11 +3660,50 @@ wss.on("connection", (ws, req) => {
                 payload.channel || DEFAULT_CHANNEL,
                 client.rank,
             );
+            const previousChannel = client.channel;
+            if (newChannel === previousChannel) {
+                return;
+            }
+
+            // Leave the old channel properly before standing on the new one.
+            // Without this a client keeps whatever they held on the channel they
+            // walked away from: the line stays keyed for everybody still on it,
+            // and their place in its queue is still theirs. A client belongs to
+            // exactly one channel, so leaving has to be as real as arriving.
+            releasePTT(room, client, "channel-changed");
+            removeClientFromQueues(room, client.id);
+
             client.channel = newChannel;
             const member = room.members.get(client.id);
             if (member) {
                 member.channel = newChannel;
             }
+
+            // Both sides are re-published: the channel they left needs its holder
+            // and queue corrected, and the one they joined needs to show them.
+            pushChannelSnapshot(room, previousChannel);
+            pushChannelSnapshot(room, newChannel);
+
+            // A local mute applies to one channel, so moving between channels can
+            // silence or free this client without anything else changing. Tell
+            // them, or their key would simply stop working with no explanation.
+            const wasMuted = isMutedOn(client, previousChannel);
+            const nowMuted = isMutedOn(client, newChannel);
+            if (wasMuted !== nowMuted) {
+                send(client.ws, {
+                    type: "mute-state",
+                    payload: {
+                        muted: nowMuted,
+                        scope: client.globalMuted ? "global" : "channel",
+                        channel: newChannel,
+                        mutedGlobally: Boolean(client.globalMuted),
+                        mutedChannels: [...(client.mutedChannels || [])],
+                        byName: nowMuted ? client.mutedByName || "" : "",
+                    },
+                });
+            }
+            const movedMember = room.members.get(client.id);
+            if (movedMember) movedMember.muted = nowMuted;
             const summary =
                 getClientSummary(member) || getLiveClientSummary(client);
             // Broadcast to everyone except the initiating client (they already updated their own state)
@@ -3383,6 +3735,11 @@ wss.on("connection", (ws, req) => {
             return;
         }
 
+        if (type === "channel-set-restricted") {
+            setChannelRestricted(room, client, payload);
+            return;
+        }
+
         if (type === "channel-rename") {
             renameChannel(room, client, payload);
             return;
@@ -3400,6 +3757,16 @@ wss.on("connection", (ws, req) => {
 
         if (type === "set-emergency-tone-seconds") {
             setEmergencyToneSeconds(room, client, payload);
+            return;
+        }
+
+        if (type === "set-transmit-channels") {
+            setTransmitChannels(room, client, payload);
+            return;
+        }
+
+        if (type === "set-interrupt-seconds") {
+            setInterruptSeconds(room, client, payload);
             return;
         }
 
@@ -3450,7 +3817,7 @@ wss.on("connection", (ws, req) => {
             // Being muted takes the emergency button with it, so it cannot be
             // used to key up over the top of the mute. Clearing one is still
             // allowed — that path is guarded by setEmergency itself.
-            if (client.muted && Boolean(payload.active)) {
+            if (isMutedOn(client, client.channel) && Boolean(payload.active)) {
                 send(client.ws, {
                     type: "error",
                     payload: {
@@ -3522,7 +3889,19 @@ wss.on("connection", (ws, req) => {
                 });
             }
 
-            requestPTT(room, client, requestedChannel);
+            // Key every channel this client is set to transmit on. For everybody
+            // except a dispatcher with extras armed this is exactly one channel,
+            // and behaves as it always did.
+            const targets = transmitChannelsFor(client);
+            targets.add(requestedChannel);
+            client.txChannels = new Set();
+            for (const ch of targets) {
+                if (!channelExists(ch)) continue;
+                // Restricted channels still respect rank, even in a broadcast.
+                if (!canAccessChannel(client.rank, ch)) continue;
+                requestPTT(room, client, ch, ch !== requestedChannel);
+                client.txChannels.add(ch);
+            }
             return;
         }
 
@@ -3530,7 +3909,15 @@ wss.on("connection", (ws, req) => {
             if (privateCallPtt(client, false)) {
                 return;
             }
-            releasePTT(room, client);
+            // Let go of every channel that was keyed, not just the one they are
+            // standing on — otherwise a broadcast leaves the others held open.
+            const held = [...(client.txChannels || [])];
+            client.txChannels = new Set();
+            if (held.length === 0) {
+                releasePTT(room, client);
+            } else {
+                for (const ch of held) releaseChannelFor(room, client, ch, "released");
+            }
             return;
         }
     });
