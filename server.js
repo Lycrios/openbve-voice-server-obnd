@@ -3719,7 +3719,23 @@ wss.on("connection", (ws, req) => {
             // walked away from: the line stays keyed for everybody still on it,
             // and their place in its queue is still theirs. A client belongs to
             // exactly one channel, so leaving has to be as real as arriving.
-            releasePTT(room, client, "channel-changed");
+            //
+            // Every keyed channel is let go, not just the one being left. A
+            // dispatcher broadcasting holds several at once, and releasePTT only
+            // ever addresses client.channel -- so moving channel mid-broadcast
+            // used to leave the rest held. Their next key resets txChannels, and
+            // with the broadcast since disarmed nothing would have released them
+            // at all: those channels stayed locked until the dispatcher dropped
+            // off the server.
+            const keyedBefore = [...(client.txChannels || [])];
+            client.txChannels = new Set();
+            if (keyedBefore.length === 0) {
+                releasePTT(room, client, "channel-changed");
+            } else {
+                for (const ch of keyedBefore) {
+                    releaseChannelFor(room, client, ch, "channel-changed");
+                }
+            }
             removeClientFromQueues(room, client.id);
 
             client.channel = newChannel;
