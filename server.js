@@ -2120,6 +2120,7 @@ function setClientTrainId(room, client, payload) {
         }
     }
 
+    const previous = target.trainId || "";
     target.trainId = trainId;
     target.trainIdLocked = true;
     rememberAssignedTrainId(room, target, trainId);
@@ -2133,6 +2134,21 @@ function setClientTrainId(room, client, payload) {
         type: "train-id-assigned",
         payload: { trainId, byName: client.name },
     });
+
+    // Told to the whole room, not just the unit whose number changed. A TID is how everyone
+    // addresses that unit on the air, so a dispatcher who did not make the change still needs to
+    // see it happen -- otherwise they carry on calling a number nobody answers to.
+    broadcastRoom(room, {
+        type: "train-id-changed",
+        payload: {
+            id: target.id,
+            trainId,
+            previousTrainId: previous,
+            name: target.name,
+            byName: client.name,
+        },
+    });
+
     broadcastMemberUpdate(room, target.id);
 }
 
