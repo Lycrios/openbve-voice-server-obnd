@@ -19,6 +19,11 @@ const PORT = Number(process.env.PORT) || 8080;
 const HTTPS_ENABLED = String(process.env.HTTPS || "").toLowerCase() === "true";
 const SSL_KEY_PATH = process.env.SSL_KEY_PATH || "";
 const SSL_CERT_PATH = process.env.SSL_CERT_PATH || "";
+
+// Shared secret for the multiplayer bridge's presence lookup. The same value the
+// bridge and the website already use between themselves. Empty disables the endpoint
+// entirely rather than leaving it open.
+const BRIDGE_TOKEN = String(process.env.BRIDGE_TOKEN || "").trim();
 const SESSION_SECRET =
     String(process.env.SESSION_SECRET || "").trim() ||
     randomBytes(32).toString("hex");
@@ -1105,7 +1110,11 @@ function httpAuthMiddleware(req, res, next) {
     if (
         req.path.startsWith("/auth/") ||
         req.path === "/login" ||
-        req.path === HEALTHCHECK_PATH
+        req.path === HEALTHCHECK_PATH ||
+        // Carries its own, stronger check: requireBridgeToken compares a shared secret
+        // in constant time and refuses when none is configured. The caller is the
+        // multiplayer bridge, which is a service and has no user session to present.
+        req.path === "/api/presence"
     ) {
         next();
         return;
@@ -2810,6 +2819,68 @@ function requestPTT(room, client, channelName, secondary = false) {
 
     pushChannelSnapshot(room, channelName);
 }
+
+/**
+ * Gate for the multiplayer bridge. Fails closed: with no secret configured the
+ * endpoint answers 503 rather than serving openly, because turning it on by accident
+ * would publish who is on the radio to anyone who asked.
+ */
+function requireBridgeToken(req, res, next) {
+    if (!BRIDGE_TOKEN) {
+        res.status(503).json({ success: false, error: "Bridge access is not configured." });
+        return;
+    }
+
+    const presented = Buffer.from(String(req.get("X-Bridge-Token") || ""));
+    const expected = Buffer.from(BRIDGE_TOKEN);
+    if (
+        presented.length !== expected.length ||
+        !timingSafeEqual(presented, expected)
+    ) {
+        res.status(403).json({ success: false, error: "Not authorised." });
+        return;
+    }
+
+    next();
+}
+
+/**
+ * Who is on the radio right now, so the website's player board can show it.
+ *
+ * Deliberately minimal: a name, the website account id where one is known, and the
+ * session role. No channel contents, no transport details, no mute state -- the bridge
+ * only needs to answer "is this player on the radio", and handing another service more
+ * than it asked for is how a small integration becomes a data leak.
+ *
+ * Someone signed in on two rooms appears once: the board asks a yes-or-no question.
+ */
+app.get("/api/presence", requireBridgeToken, (_req, res) => {
+    const byKey = new Map();
+
+    for (const room of rooms.values()) {
+        for (const member of room.members.values()) {
+            const name = typeof member.name === "string" ? member.name.trim() : "";
+            const accountId = member.accountId || null;
+            if (!name && !accountId) {
+                continue;
+            }
+
+            // Prefer the account id as the identity, since a display name can repeat.
+            const key = accountId ? `a:${accountId}` : `n:${name.toLowerCase()}`;
+            if (byKey.has(key)) {
+                continue;
+            }
+
+            byKey.set(key, {
+                username: name || null,
+                accountId: accountId,
+                role: member.role || null,
+            });
+        }
+    }
+
+    res.json({ success: true, players: [...byKey.values()] });
+});
 
 app.get("/api/rooms", (_req, res) => {
     const dbRooms = stmts.getRooms.all();
